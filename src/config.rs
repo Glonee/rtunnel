@@ -44,6 +44,8 @@ pub struct InboundConfig {
     pub listen: SocketAddr,
     pub protocol: Protocol,
     pub users: Option<Vec<UserConfig>>,
+    #[serde(default)]
+    pub padding_scheme: Vec<String>,
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -91,6 +93,7 @@ pub struct RouteRule {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct UserConfig {
+    #[serde(alias = "name")]
     pub username: String,
     pub password: String,
 }

@@ -3,18 +3,17 @@
 `rtunel` is a Rust MVP for a sing-box-like proxy with protocol-specific inbound
 and outbound implementations.
 
-Supported in this first cut:
+Supported:
 
 - SOCKS5 inbound and outbound over TCP
-- AnyTLS inbound and outbound scaffolding over BoringSSL
-- TUIC inbound and outbound scaffolding with `tokio-quiche` as the selected QUIC
-  stack
+- AnyTLS inbound and outbound over BoringSSL with TLS-exporter auth and binary
+  CONNECT framing
+- TUIC v5 command/address codec plus a `tokio-quiche` listener using TUIC ALPN
 - A TOML config format with route rules and default outbound selection
 
-The SOCKS5 path is runnable today. AnyTLS and TUIC are intentionally small MVP
-transport modules: they establish the right listener/dialer boundaries and TLS /
-QUIC library choices, but leave the production protocol framing, auth, UDP relay,
-congestion tuning, and replay protection for the next implementation pass.
+The SOCKS5 and AnyTLS TCP CONNECT paths are runnable today. TUIC has the QUIC
+listener and protocol codec in place; stream relay, UDP packet relay, and
+connection pooling are the next implementation items.
 
 ## Run
 

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::{
     config::OutboundConfig,
@@ -13,10 +14,11 @@ pub struct TuicOutbound {
 impl TuicOutbound {
     pub fn new(cfg: OutboundConfig) -> anyhow::Result<Self> {
         cfg.require_server()?;
-        anyhow::ensure!(
-            cfg.uuid.as_deref().is_some_and(|uuid| !uuid.is_empty()),
-            "tuic outbound requires uuid"
-        );
+        let uuid = cfg
+            .uuid
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("tuic outbound requires uuid"))?;
+        Uuid::parse_str(uuid)?;
         anyhow::ensure!(
             cfg.password
                 .as_deref()

@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, copy_bidirectional},
-    net::TcpListener,
-};
+use tokio::{io::copy_bidirectional, net::TcpListener};
 use tokio_boring::accept;
 use tracing::{debug, info};
 
 use crate::{
     config::InboundConfig,
+    protocol::anytls::codec,
     router::Router,
-    session::{Command, Session, TargetAddr},
+    session::{Command, Session},
     tls,
 };
 
@@ -20,9 +18,15 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
         .tls
         .as_ref()
         .context("anytls inbound requires tls config")?;
+    let padding_rules = codec::parse_padding_scheme(&cfg.padding_scheme)?;
     let acceptor = Arc::new(tls::server_acceptor(tls_cfg)?);
     let listener = TcpListener::bind(cfg.listen).await?;
-    info!(tag = %cfg.tag, listen = %cfg.listen, "anytls inbound listening");
+    info!(
+        tag = %cfg.tag,
+        listen = %cfg.listen,
+        padding_rules = padding_rules.len(),
+        "anytls inbound listening"
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -32,18 +36,21 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
         tokio::spawn(async move {
             let result = async {
                 let mut tls_stream = accept(&acceptor, stream).await?;
-                let mut first_line = String::new();
-                let mut reader = BufReader::new(&mut tls_stream);
-                reader.read_line(&mut first_line).await?;
-                let target = parse_target(first_line.trim())?;
+                let users = cfg
+                    .users
+                    .as_deref()
+                    .context("anytls inbound requires users")?;
+                let presented = codec::read_auth(&mut tls_stream).await?;
+                let username = codec::verify_auth(tls_stream.ssl(), users, &presented)?;
+                let target = codec::read_connect(&mut tls_stream).await?;
                 let session = Session {
                     inbound: cfg.tag,
                     command: Command::Connect,
                     target,
                 };
                 let mut outbound = router.dial(&session).await?;
-                reader.get_mut().write_all(b"OK\n").await?;
-                copy_bidirectional(reader.get_mut(), &mut outbound).await?;
+                debug!(%peer, %username, target = %session.target, "anytls connected");
+                copy_bidirectional(&mut tls_stream, &mut outbound).await?;
                 anyhow::Ok(())
             }
             .await;
@@ -52,14 +59,4 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
             }
         });
     }
-}
-
-fn parse_target(raw: &str) -> anyhow::Result<TargetAddr> {
-    let (host, port) = raw
-        .rsplit_once(':')
-        .context("anytls MVP expects first line as host:port")?;
-    Ok(TargetAddr::Domain {
-        host: host.to_owned(),
-        port: port.parse()?,
-    })
 }

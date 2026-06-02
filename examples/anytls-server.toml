@@ -1,0 +1,22 @@
+log_level = "info"
+
+[[inbounds]]
+tag = "anytls-in"
+listen = "127.0.0.1:8443"
+protocol = "anytls"
+padding_scheme = ["0=30-30"]
+
+[[inbounds.users]]
+name = "demo"
+password = "change-me"
+
+[inbounds.tls]
+certificate = "cert.pem"
+private_key = "key.pem"
+
+[[outbounds]]
+tag = "direct"
+protocol = "direct"
+
+[routing]
+default = "direct"

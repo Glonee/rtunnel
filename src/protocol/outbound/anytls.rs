@@ -1,13 +1,11 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
 use tokio_boring::connect;
 
 use crate::{
     config::OutboundConfig,
+    protocol::anytls::codec,
     router::Outbound,
     session::{BoxStream, Command, Session},
     tls,
@@ -39,13 +37,14 @@ impl Outbound for AnytlsOutbound {
             .as_deref()
             .context("anytls outbound requires server_name")?;
         let mut stream = connect(connector.configure()?, server_name, tcp).await?;
-        stream
-            .write_all(session.target.to_string().as_bytes())
-            .await?;
-        stream.write_all(b"\n").await?;
-        let mut ok = [0; 3];
-        stream.read_exact(&mut ok).await?;
-        anyhow::ensure!(&ok == b"OK\n", "anytls peer rejected target");
+        let password = self
+            .cfg
+            .password
+            .as_deref()
+            .context("anytls outbound requires password")?;
+        let token = codec::token(stream.ssl(), password)?;
+        codec::write_auth(&mut stream, &token).await?;
+        codec::write_connect(&mut stream, &session.target, &[]).await?;
         Ok(Box::new(stream))
     }
 }
