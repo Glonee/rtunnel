@@ -1,0 +1,18 @@
+log_level = "info"
+
+[[inbounds]]
+tag = "socks-in"
+listen = "127.0.0.1:1080"
+protocol = "socks5"
+
+[[outbounds]]
+tag = "tuic-out"
+protocol = "tuic"
+server = "127.0.0.1:4433"
+uuid = "00000000-0000-0000-0000-000000000000"
+password = "change-me"
+server_name = "example.com"
+insecure = true
+
+[routing]
+default = "tuic-out"

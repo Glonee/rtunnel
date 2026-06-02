@@ -1,0 +1,13 @@
+log_level = "info"
+
+[[inbounds]]
+tag = "socks-in"
+listen = "127.0.0.1:1080"
+protocol = "socks5"
+
+[[outbounds]]
+tag = "direct"
+protocol = "direct"
+
+[routing]
+default = "direct"
