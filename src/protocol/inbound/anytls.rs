@@ -1,17 +1,23 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
-use tokio::{io::copy_bidirectional, net::TcpListener};
-use tokio_boring::accept;
+use tokio::{
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+};
+use tokio_boring::{SslStream, accept};
 use tracing::{debug, info};
 
 use crate::{
     config::InboundConfig,
     protocol::anytls::codec,
     router::Router,
-    session::{Command, Session},
+    session::{BoxStream, Command, Session},
     tls,
 };
+
+type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let tls_cfg = cfg
@@ -34,24 +40,58 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
         let cfg = cfg.clone();
         let router = router.clone();
         tokio::spawn(async move {
-            let result = async {
+            let result: anyhow::Result<()> = async {
                 let mut tls_stream = accept(&acceptor, stream).await?;
                 let users = cfg
                     .users
                     .as_deref()
                     .context("anytls inbound requires users")?;
-                let presented = codec::read_auth(&mut tls_stream).await?;
-                let username = codec::verify_auth(tls_stream.ssl(), users, &presented)?;
-                let target = codec::read_connect(&mut tls_stream).await?;
-                let session = Session {
-                    inbound: cfg.tag,
-                    command: Command::Connect,
-                    target,
-                };
-                let mut outbound = router.dial(&session).await?;
-                debug!(%peer, %username, target = %session.target, "anytls connected");
-                copy_bidirectional(&mut tls_stream, &mut outbound).await?;
-                anyhow::Ok(())
+                let username = codec::read_client_hello(&mut tls_stream, users).await?;
+                let (mut reader, writer) = tokio::io::split(tls_stream);
+                let writer = Arc::new(Mutex::new(writer));
+                let mut streams: HashMap<u32, WriteHalf<BoxStream>> = HashMap::new();
+
+                loop {
+                    let frame = codec::read_frame(&mut reader).await?;
+                    match frame.command {
+                        codec::CMD_SETTINGS => {
+                            write_frame(&writer, codec::CMD_SERVER_SETTINGS, 0, codec::settings())
+                                .await?;
+                        }
+                        codec::CMD_SYN => {}
+                        codec::CMD_PSH => {
+                            if let Some(stream) = streams.get_mut(&frame.stream_id) {
+                                stream.write_all(&frame.data).await?;
+                                continue;
+                            }
+
+                            let (target, consumed) = codec::decode_socksaddr(&frame.data)?;
+                            let session = Session {
+                                inbound: cfg.tag.clone(),
+                                command: Command::Connect,
+                                target,
+                            };
+                            let outbound = router.dial(&session).await?;
+                            debug!(%peer, %username, target = %session.target, "anytls connected");
+                            let (read_half, mut write_half) = tokio::io::split(outbound);
+                            if consumed < frame.data.len() {
+                                write_half.write_all(&frame.data[consumed..]).await?;
+                            }
+                            streams.insert(frame.stream_id, write_half);
+                            write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[]).await?;
+                            spawn_outbound_reader(frame.stream_id, read_half, writer.clone());
+                        }
+                        codec::CMD_FIN => {
+                            streams.remove(&frame.stream_id);
+                        }
+                        codec::CMD_WASTE => {}
+                        codec::CMD_HEART_REQUEST => {
+                            write_frame(&writer, codec::CMD_HEART_RESPONSE, frame.stream_id, &[])
+                                .await?;
+                        }
+                        other => debug!(%other, "ignored anytls frame"),
+                    }
+                }
             }
             .await;
             if let Err(err) = result {
@@ -59,4 +99,47 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
             }
         });
     }
+}
+
+async fn write_frame<W>(
+    writer: &Arc<Mutex<W>>,
+    command: u8,
+    stream_id: u32,
+    data: &[u8],
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = writer.lock().await;
+    codec::write_frame(&mut *writer, command, stream_id, data).await
+}
+
+fn spawn_outbound_reader(
+    stream_id: u32,
+    mut read_half: ReadHalf<BoxStream>,
+    writer: Arc<Mutex<TlsWriteHalf>>,
+) {
+    tokio::spawn(async move {
+        let mut buf = [0; 16 * 1024];
+        loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = write_frame(&writer, codec::CMD_FIN, stream_id, &[]).await;
+                    break;
+                }
+                Ok(n) => {
+                    if write_frame(&writer, codec::CMD_PSH, stream_id, &buf[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = write_frame(&writer, codec::CMD_FIN, stream_id, &[]).await;
+                    break;
+                }
+            }
+        }
+    });
 }
