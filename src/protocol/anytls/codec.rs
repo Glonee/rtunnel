@@ -18,6 +18,7 @@ pub const CMD_HEART_REQUEST: u8 = 8;
 pub const CMD_HEART_RESPONSE: u8 = 9;
 pub const CMD_SERVER_SETTINGS: u8 = 10;
 const PASSWORD_HASH_LEN: usize = 32;
+const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaddingRule {
@@ -68,8 +69,11 @@ pub async fn write_client_hello<S>(stream: &mut S, password: &str) -> anyhow::Re
 where
     S: AsyncWrite + Unpin,
 {
-    stream.write_all(&password_hash(password)).await?;
-    stream.write_u16(0).await?;
+    let mut hello = Vec::with_capacity(PASSWORD_HASH_LEN + 2 + 30);
+    hello.extend_from_slice(&password_hash(password));
+    hello.extend_from_slice(&30u16.to_be_bytes());
+    hello.resize(PASSWORD_HASH_LEN + 2 + 30, 0);
+    stream.write_all(&hello).await?;
     Ok(())
 }
 
@@ -129,6 +133,10 @@ where
 
 pub fn settings() -> &'static [u8] {
     b"v=2"
+}
+
+pub fn client_settings() -> Vec<u8> {
+    format!("v=2\nclient=rtunel\npadding-md5={DEFAULT_PADDING_MD5}").into_bytes()
 }
 
 pub fn encode_socksaddr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {

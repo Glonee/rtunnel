@@ -50,7 +50,13 @@ impl Outbound for AnytlsOutbound {
             .context("anytls outbound requires password")?;
 
         codec::write_client_hello(&mut stream, password).await?;
-        codec::write_frame(&mut stream, codec::CMD_SETTINGS, 0, b"v=2\nclient=rtunel").await?;
+        codec::write_frame(
+            &mut stream,
+            codec::CMD_SETTINGS,
+            0,
+            &codec::client_settings(),
+        )
+        .await?;
         codec::write_connect(&mut stream, &session.target).await?;
 
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
