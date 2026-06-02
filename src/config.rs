@@ -95,6 +95,7 @@ pub struct RouteRule {
 pub struct UserConfig {
     #[serde(alias = "name")]
     pub username: String,
+    pub uuid: Option<String>,
     pub password: String,
 }
 
