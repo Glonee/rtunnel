@@ -13,12 +13,24 @@ pub const CMD_SYN: u8 = 1;
 pub const CMD_PSH: u8 = 2;
 pub const CMD_FIN: u8 = 3;
 pub const CMD_SETTINGS: u8 = 4;
+pub const CMD_ALERT: u8 = 5;
+pub const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
 pub const CMD_SYNACK: u8 = 7;
 pub const CMD_HEART_REQUEST: u8 = 8;
 pub const CMD_HEART_RESPONSE: u8 = 9;
 pub const CMD_SERVER_SETTINGS: u8 = 10;
 const PASSWORD_HASH_LEN: usize = 32;
-const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
+pub const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
+pub const DEFAULT_PADDING_SCHEME: &str = "\
+stop=8
+0=30-30
+1=100-400
+2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
+3=9-9,500-1000
+4=500-1000
+5=500-1000
+6=500-1000
+7=500-1000";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaddingRule {
@@ -69,10 +81,21 @@ pub async fn write_client_hello<S>(stream: &mut S, password: &str) -> anyhow::Re
 where
     S: AsyncWrite + Unpin,
 {
-    let mut hello = Vec::with_capacity(PASSWORD_HASH_LEN + 2 + 30);
+    write_client_hello_with_padding(stream, password, 30).await
+}
+
+pub async fn write_client_hello_with_padding<S>(
+    stream: &mut S,
+    password: &str,
+    padding_len: u16,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut hello = Vec::with_capacity(PASSWORD_HASH_LEN + 2 + padding_len as usize);
     hello.extend_from_slice(&password_hash(password));
-    hello.extend_from_slice(&30u16.to_be_bytes());
-    hello.resize(PASSWORD_HASH_LEN + 2 + 30, 0);
+    hello.extend_from_slice(&padding_len.to_be_bytes());
+    hello.resize(PASSWORD_HASH_LEN + 2 + padding_len as usize, 0);
     stream.write_all(&hello).await?;
     Ok(())
 }
@@ -136,7 +159,52 @@ pub fn settings() -> &'static [u8] {
 }
 
 pub fn client_settings() -> Vec<u8> {
-    format!("v=2\nclient=rtunel\npadding-md5={DEFAULT_PADDING_MD5}").into_bytes()
+    client_settings_with_padding_md5(DEFAULT_PADDING_MD5)
+}
+
+pub fn client_settings_with_padding_md5(padding_md5: &str) -> Vec<u8> {
+    format!("v=2\nclient=rtunel\npadding-md5={padding_md5}").into_bytes()
+}
+
+pub fn settings_version(data: &[u8]) -> Option<u8> {
+    settings_value(data, "v")?.parse().ok()
+}
+
+pub fn settings_value<'a>(data: &'a [u8], key: &str) -> Option<&'a str> {
+    let settings = std::str::from_utf8(data).ok()?;
+    settings.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name == key).then_some(value)
+    })
+}
+
+pub fn padding_scheme_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        DEFAULT_PADDING_SCHEME.to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
+pub fn padding_scheme_payload(lines: &[String]) -> Vec<u8> {
+    padding_scheme_text(lines).into_bytes()
+}
+
+pub fn padding_scheme_md5(lines: &[String]) -> String {
+    if lines.is_empty() {
+        DEFAULT_PADDING_MD5.to_owned()
+    } else {
+        format!("{:x}", md5::compute(padding_scheme_text(lines).as_bytes()))
+    }
+}
+
+pub fn padding0_len(lines: &[String]) -> anyhow::Result<u16> {
+    let rules = parse_padding_scheme(lines)?;
+    Ok(rules
+        .iter()
+        .find(|rule| rule.stage == 0)
+        .map(|rule| rule.min)
+        .unwrap_or(30))
 }
 
 pub fn encode_socksaddr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
@@ -261,5 +329,22 @@ mod tests {
 
         assert_eq!(target.to_string(), "127.0.0.1:19000");
         assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn parses_settings_values() {
+        let settings = client_settings_with_padding_md5("abc123");
+
+        assert_eq!(settings_version(&settings), Some(2));
+        assert_eq!(settings_value(&settings, "client"), Some("rtunel"));
+        assert_eq!(settings_value(&settings, "padding-md5"), Some("abc123"));
+    }
+
+    #[test]
+    fn computes_custom_padding_metadata() {
+        let scheme = vec!["stop=2".to_owned(), "0=12-12".to_owned()];
+
+        assert_ne!(padding_scheme_md5(&scheme), DEFAULT_PADDING_MD5);
+        assert_eq!(padding0_len(&scheme).unwrap(), 12);
     }
 }

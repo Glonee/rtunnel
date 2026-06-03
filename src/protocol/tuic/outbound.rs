@@ -5,6 +5,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     sync::mpsc,
+    time::{Duration, Instant},
 };
 use tokio_quiche::{
     ApplicationOverQuic, QuicResult,
@@ -25,6 +26,7 @@ use crate::{
 
 const CONNECT_STREAM_ID: u64 = 0;
 const AUTH_STREAM_ID: u64 = 2;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct TuicOutbound {
     cfg: OutboundConfig,
@@ -143,11 +145,13 @@ struct TuicClientApp {
     outbound_rx: mpsc::UnboundedReceiver<QuicWrite>,
     stream_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_writes: VecDeque<QuicWrite>,
+    next_heartbeat: Instant,
     buffer: [u8; 16 * 1024],
 }
 
 enum QuicWrite {
     Data(Vec<u8>),
+    Heartbeat,
     Close,
 }
 
@@ -166,6 +170,7 @@ impl TuicClientApp {
             outbound_rx,
             stream_tx,
             pending_writes: VecDeque::new(),
+            next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
             buffer: [0; 16 * 1024],
         }
     }
@@ -220,8 +225,16 @@ impl ApplicationOverQuic for TuicClientApp {
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
         if self.pending_writes.is_empty() {
-            if let Some(write) = self.outbound_rx.recv().await {
-                self.pending_writes.push_back(write);
+            tokio::select! {
+                write = self.outbound_rx.recv() => {
+                    if let Some(write) = write {
+                        self.pending_writes.push_back(write);
+                    }
+                }
+                _ = tokio::time::sleep_until(self.next_heartbeat) => {
+                    self.pending_writes.push_back(QuicWrite::Heartbeat);
+                    self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+                }
             }
         }
         Ok(())
@@ -245,6 +258,9 @@ impl ApplicationOverQuic for TuicClientApp {
                 }
             }
         }
+
+        let mut dgram = [0; 1500];
+        while let Ok(_read) = qconn.dgram_recv(&mut dgram) {}
         Ok(())
     }
 
@@ -268,6 +284,16 @@ impl ApplicationOverQuic for TuicClientApp {
                     }
                     Err(err) => return Err(Box::new(err)),
                 },
+                QuicWrite::Heartbeat => {
+                    match qconn.dgram_send(&[codec::VERSION, codec::CMD_HEARTBEAT]) {
+                        Ok(_) => {}
+                        Err(quiche::Error::Done) => {
+                            self.pending_writes.push_front(QuicWrite::Heartbeat);
+                            break;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
                 QuicWrite::Close => match qconn.stream_send(CONNECT_STREAM_ID, &[], true) {
                     Ok(_) => {}
                     Err(quiche::Error::Done) => {

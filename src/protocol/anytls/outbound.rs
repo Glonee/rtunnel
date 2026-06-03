@@ -1,13 +1,19 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
-use tokio_boring::SslStreamBuilder;
+use tokio_boring::{SslStream, SslStreamBuilder};
 
 use crate::{
     config::OutboundConfig,
@@ -19,22 +25,40 @@ use crate::{
 
 pub struct AnytlsOutbound {
     cfg: OutboundConfig,
+    state: Arc<Mutex<ClientState>>,
+    session: Arc<Mutex<Option<Arc<ClientSession>>>>,
+}
+
+#[derive(Default)]
+struct ClientState {
+    padding_scheme: Vec<String>,
+    padding_md5: Option<String>,
 }
 
 impl AnytlsOutbound {
     pub fn new(cfg: OutboundConfig) -> anyhow::Result<Self> {
         cfg.require_server()?;
-        Ok(Self { cfg })
+        Ok(Self {
+            cfg,
+            state: Arc::new(Mutex::new(ClientState::default())),
+            session: Arc::new(Mutex::new(None)),
+        })
     }
-}
 
-#[async_trait]
-impl Outbound for AnytlsOutbound {
-    async fn dial(&self, session: &Session) -> anyhow::Result<BoxStream> {
-        anyhow::ensure!(
-            matches!(session.command, Command::Connect),
-            "anytls outbound only supports CONNECT"
-        );
+    async fn session(&self) -> anyhow::Result<Arc<ClientSession>> {
+        let mut slot = self.session.lock().await;
+        if let Some(session) = slot.as_ref()
+            && !session.is_closed()
+        {
+            return Ok(session.clone());
+        }
+
+        let session = self.connect_session().await?;
+        *slot = Some(session.clone());
+        Ok(session)
+    }
+
+    async fn connect_session(&self) -> anyhow::Result<Arc<ClientSession>> {
         let tcp = TcpStream::connect(self.cfg.require_server()?).await?;
         let connector = tls::chrome_like_connector(self.cfg.insecure)?;
         let server_name = self
@@ -50,43 +74,86 @@ impl Outbound for AnytlsOutbound {
             .password
             .as_deref()
             .context("anytls outbound requires password")?;
+        let (padding_md5, padding0_len) = {
+            let state = self.state.lock().await;
+            (
+                state
+                    .padding_md5
+                    .clone()
+                    .unwrap_or_else(|| codec::DEFAULT_PADDING_MD5.to_owned()),
+                codec::padding0_len(&state.padding_scheme)?,
+            )
+        };
 
-        codec::write_client_hello(&mut stream, password).await?;
+        codec::write_client_hello_with_padding(&mut stream, password, padding0_len).await?;
         codec::write_frame(
             &mut stream,
             codec::CMD_SETTINGS,
             0,
-            &codec::client_settings(),
+            &codec::client_settings_with_padding_md5(&padding_md5),
         )
         .await?;
-        codec::write_connect(&mut stream, &session.target).await?;
 
+        let (tls_reader, tls_writer) = tokio::io::split(stream);
+        let session = Arc::new(ClientSession::new(tls_writer));
+        tokio::spawn(session.clone().run_reader(tls_reader, self.state.clone()));
+        Ok(session)
+    }
+}
+
+#[async_trait]
+impl Outbound for AnytlsOutbound {
+    async fn dial(&self, session: &Session) -> anyhow::Result<BoxStream> {
+        anyhow::ensure!(
+            matches!(session.command, Command::Connect),
+            "anytls outbound only supports CONNECT"
+        );
+        let session_state = self.session().await?;
+        let stream_id = session_state.next_stream_id()?;
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
         let (mut app_reader, mut app_writer) = tokio::io::split(relay_side);
-        let (mut tls_reader, tls_writer) = tokio::io::split(stream);
-        let tls_writer = Arc::new(Mutex::new(tls_writer));
-        const STREAM_ID: u32 = 1;
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(32);
 
         {
-            let tls_writer = tls_writer.clone();
+            let mut streams = session_state.streams.lock().await;
+            streams.insert(stream_id, data_tx);
+        }
+
+        if let Err(err) = session_state
+            .write_connect(stream_id, &session.target)
+            .await
+        {
+            session_state.close();
+            session_state.streams.lock().await.remove(&stream_id);
+            return Err(err);
+        }
+
+        {
+            let session_state = session_state.clone();
             tokio::spawn(async move {
                 let mut buf = [0; 16 * 1024];
                 loop {
                     match app_reader.read(&mut buf).await {
                         Ok(0) => {
-                            let _ = write_frame(&tls_writer, codec::CMD_FIN, STREAM_ID, &[]).await;
+                            let _ = session_state
+                                .write_frame(codec::CMD_FIN, stream_id, &[])
+                                .await;
                             break;
                         }
                         Ok(n) => {
-                            if write_frame(&tls_writer, codec::CMD_PSH, STREAM_ID, &buf[..n])
+                            if session_state
+                                .write_frame(codec::CMD_PSH, stream_id, &buf[..n])
                                 .await
                                 .is_err()
                             {
+                                session_state.close();
                                 break;
                             }
                         }
                         Err(_) => {
-                            let _ = write_frame(&tls_writer, codec::CMD_FIN, STREAM_ID, &[]).await;
+                            let _ = session_state
+                                .write_frame(codec::CMD_FIN, stream_id, &[])
+                                .await;
                             break;
                         }
                     }
@@ -95,31 +162,9 @@ impl Outbound for AnytlsOutbound {
         }
 
         tokio::spawn(async move {
-            loop {
-                match codec::read_frame(&mut tls_reader).await {
-                    Ok(frame)
-                        if frame.command == codec::CMD_PSH && frame.stream_id == STREAM_ID =>
-                    {
-                        if app_writer.write_all(&frame.data).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(frame)
-                        if frame.command == codec::CMD_FIN && frame.stream_id == STREAM_ID =>
-                    {
-                        break;
-                    }
-                    Ok(frame) if frame.command == codec::CMD_HEART_REQUEST => {
-                        let _ = write_frame(
-                            &tls_writer,
-                            codec::CMD_HEART_RESPONSE,
-                            frame.stream_id,
-                            &[],
-                        )
-                        .await;
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
+            while let Some(data) = data_rx.recv().await {
+                if app_writer.write_all(&data).await.is_err() {
+                    break;
                 }
             }
         });
@@ -128,15 +173,114 @@ impl Outbound for AnytlsOutbound {
     }
 }
 
-async fn write_frame<W>(
-    writer: &Arc<Mutex<W>>,
-    command: u8,
-    stream_id: u32,
-    data: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut writer = writer.lock().await;
-    codec::write_frame(&mut *writer, command, stream_id, data).await
+type TlsReadHalf = ReadHalf<SslStream<TcpStream>>;
+type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
+
+struct ClientSession {
+    writer: Arc<Mutex<TlsWriteHalf>>,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    next_stream_id: AtomicU32,
+    closed: AtomicBool,
+}
+
+impl ClientSession {
+    fn new(writer: TlsWriteHalf) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            next_stream_id: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn next_stream_id(&self) -> anyhow::Result<u32> {
+        let id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(id != 0, "anytls stream id overflow");
+        Ok(id)
+    }
+
+    async fn write_connect(
+        &self,
+        stream_id: u32,
+        target: &crate::session::TargetAddr,
+    ) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().await;
+        codec::write_frame(&mut *writer, codec::CMD_SYN, stream_id, &[]).await?;
+        codec::write_frame(
+            &mut *writer,
+            codec::CMD_PSH,
+            stream_id,
+            &codec::encode_socksaddr(target)?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_frame(&self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().await;
+        codec::write_frame(&mut *writer, command, stream_id, data).await
+    }
+
+    async fn run_reader(
+        self: Arc<Self>,
+        mut tls_reader: TlsReadHalf,
+        state: Arc<Mutex<ClientState>>,
+    ) {
+        loop {
+            match codec::read_frame(&mut tls_reader).await {
+                Ok(frame) if frame.command == codec::CMD_PSH => {
+                    let tx = { self.streams.lock().await.get(&frame.stream_id).cloned() };
+                    if let Some(tx) = tx
+                        && tx.send(frame.data).await.is_err()
+                    {
+                        self.streams.lock().await.remove(&frame.stream_id);
+                    }
+                }
+                Ok(frame) if frame.command == codec::CMD_FIN => {
+                    self.streams.lock().await.remove(&frame.stream_id);
+                }
+                Ok(frame) if frame.command == codec::CMD_SYNACK && !frame.data.is_empty() => {
+                    tracing::warn!(
+                        stream_id = frame.stream_id,
+                        message = %String::from_utf8_lossy(&frame.data),
+                        "anytls stream open failed"
+                    );
+                    self.streams.lock().await.remove(&frame.stream_id);
+                }
+                Ok(frame) if frame.command == codec::CMD_HEART_REQUEST => {
+                    let _ = self
+                        .write_frame(codec::CMD_HEART_RESPONSE, frame.stream_id, &[])
+                        .await;
+                }
+                Ok(frame) if frame.command == codec::CMD_UPDATE_PADDING_SCHEME => {
+                    if let Ok(scheme) = String::from_utf8(frame.data) {
+                        let lines = scheme.lines().map(str::to_owned).collect::<Vec<_>>();
+                        let mut state = state.lock().await;
+                        state.padding_md5 = Some(codec::padding_scheme_md5(&lines));
+                        state.padding_scheme = lines;
+                    }
+                }
+                Ok(frame) if frame.command == codec::CMD_ALERT => {
+                    tracing::warn!(
+                        message = %String::from_utf8_lossy(&frame.data),
+                        "anytls server alert"
+                    );
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        self.close();
+        self.streams.lock().await.clear();
+    }
 }
