@@ -7,7 +7,7 @@ use tokio::{
     net::TcpStream,
     sync::Mutex,
 };
-use tokio_boring::connect;
+use tokio_boring::SslStreamBuilder;
 
 use crate::{
     config::OutboundConfig,
@@ -42,7 +42,9 @@ impl Outbound for AnytlsOutbound {
             .server_name
             .as_deref()
             .context("anytls outbound requires server_name")?;
-        let mut stream = connect(connector.configure()?, server_name, tcp).await?;
+        let ssl = connector.configure()?.into_ssl(server_name)?;
+        ssl.set_enable_ech_grease(true);
+        let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
         let password = self
             .cfg
             .password

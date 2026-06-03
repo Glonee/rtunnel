@@ -28,6 +28,15 @@ use crate::{
 };
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
+    let socket = UdpSocket::bind(cfg.listen).await?;
+    serve(socket, cfg, router).await
+}
+
+pub async fn serve(
+    socket: UdpSocket,
+    cfg: InboundConfig,
+    router: Arc<Router>,
+) -> anyhow::Result<()> {
     let tls = cfg
         .tls
         .as_ref()
@@ -47,7 +56,6 @@ pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> 
         Hooks::default(),
     );
 
-    let socket = UdpSocket::bind(cfg.listen).await?;
     let mut listeners = tokio_quiche::listen([socket], params, DefaultMetrics)?;
     let mut connections = listeners.remove(0);
     info!(

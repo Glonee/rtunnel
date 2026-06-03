@@ -20,13 +20,21 @@ use crate::{
 type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(cfg.listen).await?;
+    serve(listener, cfg, router).await
+}
+
+pub async fn serve(
+    listener: TcpListener,
+    cfg: InboundConfig,
+    router: Arc<Router>,
+) -> anyhow::Result<()> {
     let tls_cfg = cfg
         .tls
         .as_ref()
         .context("anytls inbound requires tls config")?;
     let padding_rules = codec::parse_padding_scheme(&cfg.padding_scheme)?;
     let acceptor = Arc::new(tls::server_acceptor(tls_cfg)?);
-    let listener = TcpListener::bind(cfg.listen).await?;
     info!(
         tag = %cfg.tag,
         listen = %cfg.listen,

@@ -1,4 +1,9 @@
-use boring::ssl::{SslConnector, SslFiletype, SslMethod, SslOptions, SslVerifyMode, SslVersion};
+use std::io::{Cursor, Write};
+
+use boring::ssl::{
+    CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslFiletype, SslMethod,
+    SslOptions, SslVerifyMode, SslVersion,
+};
 
 use crate::config::TlsServerConfig;
 
@@ -38,11 +43,28 @@ pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
     builder.set_permute_extensions(true);
     builder.enable_ocsp_stapling();
     builder.enable_signed_cert_timestamps();
+    builder.add_certificate_compression_algorithm(BrotliCertificateDecompressor)?;
     builder.set_options(SslOptions::NO_COMPRESSION);
     if insecure {
         builder.set_verify(SslVerifyMode::NONE);
     }
     Ok(builder.build())
+}
+
+#[derive(Default)]
+struct BrotliCertificateDecompressor;
+
+impl CertificateCompressor for BrotliCertificateDecompressor {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::BROTLI;
+    const CAN_COMPRESS: bool = false;
+    const CAN_DECOMPRESS: bool = true;
+
+    fn decompress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+    where
+        W: Write,
+    {
+        brotli::BrotliDecompress(&mut Cursor::new(input), output)
+    }
 }
 
 pub fn server_acceptor(tls: &TlsServerConfig) -> anyhow::Result<boring::ssl::SslAcceptor> {

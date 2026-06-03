@@ -18,6 +18,14 @@ use crate::{
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
+    serve(listener, cfg, router).await
+}
+
+pub async fn serve(
+    listener: TcpListener,
+    cfg: InboundConfig,
+    router: Arc<Router>,
+) -> anyhow::Result<()> {
     info!(tag = %cfg.tag, listen = %cfg.listen, "socks5 inbound listening");
 
     loop {

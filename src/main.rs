@@ -1,17 +1,10 @@
-mod config;
-mod protocol;
-mod router;
-mod session;
-mod tls;
-
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
+use rtunel::{config::Config, protocol, router::Router};
 use tokio::signal;
 use tracing::info;
-
-use crate::{config::Config, protocol::inbound, router::Router};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     for inbound_cfg in cfg.inbounds.clone() {
         let router = router.clone();
         tokio::spawn(async move {
-            if let Err(err) = inbound::run(inbound_cfg, router).await {
+            if let Err(err) = protocol::run_inbound(inbound_cfg, router).await {
                 tracing::error!(%err, "inbound exited");
             }
         });

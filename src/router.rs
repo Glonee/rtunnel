@@ -5,8 +5,9 @@ use async_trait::async_trait;
 
 use crate::{
     config::{Config, OutboundConfig, Protocol},
-    protocol::outbound::{
-        anytls::AnytlsOutbound, direct::DirectOutbound, socks5::Socks5Outbound, tuic::TuicOutbound,
+    protocol::{
+        anytls::outbound::AnytlsOutbound, direct::outbound::DirectOutbound,
+        socks5::outbound::Socks5Outbound, tuic::outbound::TuicOutbound,
     },
     session::{BoxStream, Session},
 };
