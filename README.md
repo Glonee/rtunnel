@@ -8,12 +8,16 @@ Supported:
 - SOCKS5 inbound and outbound over TCP
 - AnyTLS inbound and outbound over BoringSSL with TLS-exporter auth and binary
   CONNECT framing
-- TUIC v5 command/address codec plus a `tokio-quiche` listener using TUIC ALPN
+- TUIC v5 inbound and outbound over `tokio-quiche`, including TCP relay,
+  authentication, heartbeat, and UDP packet relay modes
 - A TOML config format with route rules and default outbound selection
 
-The SOCKS5 and AnyTLS TCP CONNECT paths are runnable today. TUIC has the QUIC
-listener and protocol codec in place; stream relay, UDP packet relay, and
-connection pooling are the next implementation items.
+For the expected workflow when adding or completing a protocol, see
+[`docs/protocol-implementation-guide.md`](docs/protocol-implementation-guide.md).
+
+The SOCKS5, AnyTLS, and TUIC TCP CONNECT paths are runnable today. AnyTLS still
+needs full packet-level padding/splitting, and the public outbound abstraction is
+currently stream-oriented, so UDP behavior is tested at the protocol level.
 
 ## Run
 
