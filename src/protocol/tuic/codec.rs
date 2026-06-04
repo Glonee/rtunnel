@@ -2,20 +2,22 @@ use boring::ssl::SslRef;
 use foreign_types::ForeignTypeRef;
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Read},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    io::Cursor,
     os::raw::{c_char, c_int, c_uchar},
+};
+use tuic_core::{
+    Address, Authenticate, Connect, Dissociate, Header, Heartbeat, Packet as CorePacket,
 };
 use uuid::Uuid;
 
 use crate::session::TargetAddr;
 
-pub const VERSION: u8 = 0x05;
-pub const CMD_AUTHENTICATE: u8 = 0x00;
-pub const CMD_CONNECT: u8 = 0x01;
-pub const CMD_PACKET: u8 = 0x02;
-pub const CMD_DISSOCIATE: u8 = 0x03;
-pub const CMD_HEARTBEAT: u8 = 0x04;
+pub const VERSION: u8 = tuic_core::VERSION;
+pub const CMD_AUTHENTICATE: u8 = Header::TYPE_CODE_AUTHENTICATE;
+pub const CMD_CONNECT: u8 = Header::TYPE_CODE_CONNECT;
+pub const CMD_PACKET: u8 = Header::TYPE_CODE_PACKET;
+pub const CMD_DISSOCIATE: u8 = Header::TYPE_CODE_DISSOCIATE;
+pub const CMD_HEARTBEAT: u8 = Header::TYPE_CODE_HEARTBEAT;
 pub const TOKEN_LEN: usize = 32;
 pub const AUTHENTICATE_LEN: usize = 2 + 16 + TOKEN_LEN;
 
@@ -60,65 +62,48 @@ fn export_keying_material_raw_label(
     Ok(())
 }
 
+pub fn encode_authenticate(uuid: Uuid, token: [u8; TOKEN_LEN]) -> anyhow::Result<Vec<u8>> {
+    marshal_header(Header::Authenticate(Authenticate::new(uuid, token)))
+}
+
 pub fn parse_authenticate(data: &[u8]) -> anyhow::Result<(Uuid, [u8; TOKEN_LEN])> {
-    anyhow::ensure!(data.len() >= AUTHENTICATE_LEN, "short tuic authenticate");
-    anyhow::ensure!(data[0] == VERSION, "unsupported tuic version {}", data[0]);
-    anyhow::ensure!(
-        data[1] == CMD_AUTHENTICATE,
-        "unexpected tuic command {}",
-        data[1]
-    );
-    let mut uuid = [0; 16];
-    uuid.copy_from_slice(&data[2..18]);
-    let mut token = [0; TOKEN_LEN];
-    token.copy_from_slice(&data[18..50]);
-    Ok((Uuid::from_bytes(uuid), token))
+    let (header, _) = parse_header(data)?;
+    let Header::Authenticate(auth) = header else {
+        anyhow::bail!(
+            "unexpected tuic command {}, expected authenticate",
+            header.type_code()
+        );
+    };
+    Ok((auth.uuid(), auth.token()))
 }
 
 pub fn parse_connect(data: &[u8]) -> anyhow::Result<(TargetAddr, usize)> {
-    anyhow::ensure!(data.len() >= 2, "short tuic connect");
-    anyhow::ensure!(data[0] == VERSION, "unsupported tuic version {}", data[0]);
-    anyhow::ensure!(
-        data[1] == CMD_CONNECT,
-        "unexpected tuic command {}",
-        data[1]
-    );
-    decode_addr(&data[2..]).map(|(target, consumed)| (target, consumed + 2))
+    let (header, consumed) = parse_header(data)?;
+    let Header::Connect(connect) = header else {
+        anyhow::bail!(
+            "unexpected tuic command {}, expected connect",
+            header.type_code()
+        );
+    };
+    Ok((address_to_target(connect.addr())?, consumed))
 }
 
 pub fn encode_addr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    match target {
-        TargetAddr::Domain { host, port } => {
-            anyhow::ensure!(host.len() <= 255, "domain is too long");
-            output.push(0x00);
-            output.push(host.len() as u8);
-            output.extend_from_slice(host.as_bytes());
-            output.extend_from_slice(&port.to_be_bytes());
-        }
-        TargetAddr::Ip(addr) if addr.is_ipv4() => {
-            output.push(0x01);
-            if let IpAddr::V4(ip) = addr.ip() {
-                output.extend_from_slice(&ip.octets());
-            }
-            output.extend_from_slice(&addr.port().to_be_bytes());
-        }
-        TargetAddr::Ip(addr) => {
-            output.push(0x02);
-            if let IpAddr::V6(ip) = addr.ip() {
-                output.extend_from_slice(&ip.octets());
-            }
-            output.extend_from_slice(&addr.port().to_be_bytes());
-        }
-    }
-    Ok(output)
+    let encoded = marshal_header(Header::Connect(Connect::new(target_to_address(target)?)))?;
+    Ok(encoded[2..].to_vec())
+}
+
+pub fn decode_addr(data: &[u8]) -> anyhow::Result<(TargetAddr, usize)> {
+    let mut connect = Vec::with_capacity(2 + data.len());
+    connect.push(VERSION);
+    connect.push(CMD_CONNECT);
+    connect.extend_from_slice(data);
+    let (target, consumed) = parse_connect(&connect)?;
+    Ok((target, consumed - 2))
 }
 
 pub fn encode_connect(target: &TargetAddr, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(2 + 259 + payload.len());
-    output.push(VERSION);
-    output.push(CMD_CONNECT);
-    output.extend_from_slice(&encode_addr(target)?);
+    let mut output = marshal_header(Header::Connect(Connect::new(target_to_address(target)?)))?;
     output.extend_from_slice(payload);
     Ok(output)
 }
@@ -147,73 +132,76 @@ pub fn encode_packet(packet: &Packet) -> anyhow::Result<Vec<u8>> {
         "tuic packet fragment is too large"
     );
 
-    let mut output = Vec::with_capacity(10 + 259 + packet.payload.len());
-    output.push(VERSION);
-    output.push(CMD_PACKET);
-    output.extend_from_slice(&packet.assoc_id.to_be_bytes());
-    output.extend_from_slice(&packet.pkt_id.to_be_bytes());
-    output.push(packet.frag_total);
-    output.push(packet.frag_id);
-    output.extend_from_slice(&(packet.payload.len() as u16).to_be_bytes());
-    if let Some(target) = &packet.target {
-        output.extend_from_slice(&encode_addr(target)?);
-    } else {
-        output.push(0xff);
-    }
+    let addr = match packet.target.as_ref() {
+        Some(target) => target_to_address(target)?,
+        None => Address::None,
+    };
+    let header = Header::Packet(CorePacket::new(
+        packet.assoc_id,
+        packet.pkt_id,
+        packet.frag_total,
+        packet.frag_id,
+        packet.payload.len() as u16,
+        addr,
+    ));
+    let mut output = marshal_header(header)?;
     output.extend_from_slice(&packet.payload);
     Ok(output)
 }
 
 pub fn parse_packet(data: &[u8]) -> anyhow::Result<Packet> {
-    anyhow::ensure!(data.len() >= 10, "short tuic packet");
-    anyhow::ensure!(data[0] == VERSION, "unsupported tuic version {}", data[0]);
-    anyhow::ensure!(data[1] == CMD_PACKET, "unexpected tuic command {}", data[1]);
-    let mut cursor = Cursor::new(&data[2..]);
-    let assoc_id = read_u16(&mut cursor)?;
-    let pkt_id = read_u16(&mut cursor)?;
-    let frag_total = read_u8(&mut cursor)?;
-    let frag_id = read_u8(&mut cursor)?;
-    let size = read_u16(&mut cursor)? as usize;
-    anyhow::ensure!(frag_total > 0, "packet fragment total cannot be zero");
+    let (header, payload_start) = parse_header(data)?;
+    let Header::Packet(packet) = header else {
+        anyhow::bail!(
+            "unexpected tuic command {}, expected packet",
+            header.type_code()
+        );
+    };
     anyhow::ensure!(
-        frag_id < frag_total,
+        packet.frag_total() > 0,
+        "packet fragment total cannot be zero"
+    );
+    anyhow::ensure!(
+        packet.frag_id() < packet.frag_total(),
         "packet fragment id exceeds fragment total"
     );
-
-    let addr_start = 2 + cursor.position() as usize;
-    let (target, consumed) = decode_optional_addr(&data[addr_start..])?;
-    let payload_start = addr_start + consumed;
     let payload_end = payload_start
-        .checked_add(size)
+        .checked_add(packet.size() as usize)
         .ok_or_else(|| anyhow::anyhow!("tuic packet size overflow"))?;
     anyhow::ensure!(payload_end <= data.len(), "short tuic packet payload");
     Ok(Packet {
-        assoc_id,
-        pkt_id,
-        frag_total,
-        frag_id,
-        target,
+        assoc_id: packet.assoc_id(),
+        pkt_id: packet.pkt_id(),
+        frag_total: packet.frag_total(),
+        frag_id: packet.frag_id(),
+        target: address_to_optional_target(packet.addr())?,
         payload: data[payload_start..payload_end].to_vec(),
     })
 }
 
 pub fn encode_dissociate(assoc_id: u16) -> Vec<u8> {
-    let mut output = Vec::with_capacity(4);
-    output.push(VERSION);
-    output.push(CMD_DISSOCIATE);
-    output.extend_from_slice(&assoc_id.to_be_bytes());
-    output
+    marshal_header(Header::Dissociate(Dissociate::new(assoc_id))).unwrap_or_else(|_| {
+        let mut output = Vec::with_capacity(4);
+        output.push(VERSION);
+        output.push(CMD_DISSOCIATE);
+        output.extend_from_slice(&assoc_id.to_be_bytes());
+        output
+    })
 }
 
 pub fn parse_dissociate(data: &[u8]) -> anyhow::Result<u16> {
-    anyhow::ensure!(data.len() >= 4, "short tuic dissociate");
-    anyhow::ensure!(data[0] == VERSION, "unsupported tuic version {}", data[0]);
-    anyhow::ensure!(
-        data[1] == CMD_DISSOCIATE,
-        "unexpected tuic command {}",
-        data[1]
-    );
-    Ok(u16::from_be_bytes([data[2], data[3]]))
+    let (header, _) = parse_header(data)?;
+    let Header::Dissociate(dissociate) = header else {
+        anyhow::bail!(
+            "unexpected tuic command {}, expected dissociate",
+            header.type_code()
+        );
+    };
+    Ok(dissociate.assoc_id())
+}
+
+pub fn encode_heartbeat() -> anyhow::Result<Vec<u8>> {
+    marshal_header(Header::Heartbeat(Heartbeat::new()))
 }
 
 #[derive(Default)]
@@ -285,63 +273,50 @@ struct FragmentedPacket {
     fragments: BTreeMap<u8, Vec<u8>>,
 }
 
-pub fn decode_addr(data: &[u8]) -> anyhow::Result<(TargetAddr, usize)> {
+fn marshal_header(header: Header) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(header.len());
+    header.marshal(&mut output)?;
+    Ok(output)
+}
+
+fn parse_header(data: &[u8]) -> anyhow::Result<(Header, usize)> {
     let mut cursor = Cursor::new(data);
-    let atyp = read_u8(&mut cursor)?;
-    let target = match atyp {
-        0x00 => {
-            let len = read_u8(&mut cursor)? as usize;
-            let mut host = vec![0; len];
-            Read::read_exact(&mut cursor, &mut host)?;
-            let port = read_u16(&mut cursor)?;
-            TargetAddr::Domain {
-                host: String::from_utf8(host)?,
-                port,
-            }
-        }
-        0x01 => {
-            let mut octets = [0; 4];
-            Read::read_exact(&mut cursor, &mut octets)?;
-            let port = read_u16(&mut cursor)?;
-            TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
-        }
-        0x02 => {
-            let mut octets = [0; 16];
-            Read::read_exact(&mut cursor, &mut octets)?;
-            let port = read_u16(&mut cursor)?;
-            TargetAddr::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
-        }
-        0xff => anyhow::bail!("empty address is not valid for TCP connect"),
-        other => anyhow::bail!("unknown tuic address family {other}"),
-    };
-    Ok((target, cursor.position() as usize))
+    let header = Header::unmarshal(&mut cursor)?;
+    Ok((header, cursor.position() as usize))
 }
 
-fn decode_optional_addr(data: &[u8]) -> anyhow::Result<(Option<TargetAddr>, usize)> {
-    let Some(atyp) = data.first() else {
-        anyhow::bail!("missing tuic address family");
-    };
-    if *atyp == 0xff {
-        return Ok((None, 1));
+fn target_to_address(target: &TargetAddr) -> anyhow::Result<Address> {
+    Ok(match target {
+        TargetAddr::Domain { host, port } => {
+            anyhow::ensure!(host.len() <= 255, "domain is too long");
+            Address::DomainAddress(host.clone(), *port)
+        }
+        TargetAddr::Ip(addr) => Address::SocketAddress(*addr),
+    })
+}
+
+fn address_to_target(address: &Address) -> anyhow::Result<TargetAddr> {
+    match address {
+        Address::DomainAddress(host, port) => Ok(TargetAddr::Domain {
+            host: host.clone(),
+            port: *port,
+        }),
+        Address::SocketAddress(addr) => Ok(TargetAddr::Ip(*addr)),
+        Address::None => anyhow::bail!("empty address is not valid for TCP connect"),
     }
-    decode_addr(data).map(|(target, consumed)| (Some(target), consumed))
 }
 
-fn read_u8(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u8> {
-    let mut buf = [0; 1];
-    Read::read_exact(cursor, &mut buf)?;
-    Ok(buf[0])
-}
-
-fn read_u16(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u16> {
-    let mut buf = [0; 2];
-    Read::read_exact(cursor, &mut buf)?;
-    Ok(u16::from_be_bytes(buf))
+fn address_to_optional_target(address: &Address) -> anyhow::Result<Option<TargetAddr>> {
+    match address {
+        Address::None => Ok(None),
+        other => Ok(Some(address_to_target(other)?)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn decodes_connect_target() {
@@ -367,6 +342,19 @@ mod tests {
         let decoded = parse_packet(&encoded).unwrap();
 
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn roundtrips_authenticate() {
+        let uuid = Uuid::from_u128(1);
+        let token = [7; TOKEN_LEN];
+
+        let encoded = encode_authenticate(uuid, token).unwrap();
+        let (decoded_uuid, decoded_token) = parse_authenticate(&encoded).unwrap();
+
+        assert_eq!(encoded.len(), AUTHENTICATE_LEN);
+        assert_eq!(decoded_uuid, uuid);
+        assert_eq!(decoded_token, token);
     }
 
     #[test]
