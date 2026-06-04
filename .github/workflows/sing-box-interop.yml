@@ -1,0 +1,45 @@
+name: sing-box interop
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - src/**
+      - scripts/interop-sing-box.mjs
+      - .github/workflows/sing-box-interop.yml
+
+env:
+  SING_BOX_VERSION: 1.13.13
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download sing-box
+        run: |
+          mkdir -p /tmp/sing-box
+          curl -fsSL \
+            -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box --strip-components=1
+          /tmp/sing-box/sing-box version
+
+      - name: Build rtunel
+        run: cargo build --locked
+
+      - name: Run sing-box interop
+        env:
+          SING_BOX_BIN: /tmp/sing-box/sing-box
+        run: node scripts/interop-sing-box.mjs
