@@ -251,11 +251,7 @@ impl ApplicationOverQuic for TuicClientApp {
         _handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
         let token = codec::token(qconn.as_mut(), self.uuid, &self.password)?;
-        let mut auth = Vec::with_capacity(codec::AUTHENTICATE_LEN);
-        auth.push(codec::VERSION);
-        auth.push(codec::CMD_AUTHENTICATE);
-        auth.extend_from_slice(self.uuid.as_bytes());
-        auth.extend_from_slice(&token);
+        let auth = codec::encode_authenticate(self.uuid, token)?;
         qconn.stream_send(AUTH_STREAM_ID, &auth, true)?;
 
         let connect = codec::encode_connect(&self.target, &[])?;
@@ -333,7 +329,8 @@ impl ApplicationOverQuic for TuicClientApp {
                     Err(err) => return Err(Box::new(err)),
                 },
                 QuicWrite::Heartbeat => {
-                    match qconn.dgram_send(&[codec::VERSION, codec::CMD_HEARTBEAT]) {
+                    let heartbeat = codec::encode_heartbeat()?;
+                    match qconn.dgram_send(&heartbeat) {
                         Ok(_) => {}
                         Err(quiche::Error::Done) => {
                             self.pending_writes.push_front(QuicWrite::Heartbeat);
@@ -438,11 +435,7 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
         _handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
         let token = codec::token(qconn.as_mut(), self.uuid, &self.password)?;
-        let mut auth = Vec::with_capacity(codec::AUTHENTICATE_LEN);
-        auth.push(codec::VERSION);
-        auth.push(codec::CMD_AUTHENTICATE);
-        auth.extend_from_slice(self.uuid.as_bytes());
-        auth.extend_from_slice(&token);
+        let auth = codec::encode_authenticate(self.uuid, token)?;
         qconn.stream_send(AUTH_STREAM_ID, &auth, true)?;
         Ok(())
     }
@@ -524,7 +517,8 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
                     }
                 }
                 TuicUdpWrite::Heartbeat => {
-                    match qconn.dgram_send(&[codec::VERSION, codec::CMD_HEARTBEAT]) {
+                    let heartbeat = codec::encode_heartbeat()?;
+                    match qconn.dgram_send(&heartbeat) {
                         Ok(_) => {}
                         Err(quiche::Error::Done) => {
                             self.pending_writes.push_front(TuicUdpWrite::Heartbeat);
