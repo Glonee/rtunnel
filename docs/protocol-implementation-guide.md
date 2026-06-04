@@ -163,9 +163,9 @@ Outbound checklist:
 - Do not hard-code test credentials or ports.
 - Return clear errors for unsupported commands.
 
-The current `Outbound` trait is stream-oriented. If the protocol has first-class
-UDP behavior, add tests through protocol-level helpers first, then extend the
-public abstraction deliberately.
+Protocols with UDP support should implement `Outbound::dial_udp` and return a
+shared `ProxyDatagram` session. Keep target-addressed packet handling inside the
+protocol session, and cover it with both loopback and interop tests.
 
 ## Step 6: Test Inside rtunel
 

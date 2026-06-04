@@ -15,9 +15,9 @@ Supported:
 For the expected workflow when adding or completing a protocol, see
 [`docs/protocol-implementation-guide.md`](docs/protocol-implementation-guide.md).
 
-The SOCKS5, AnyTLS, and TUIC TCP CONNECT paths are runnable today. AnyTLS still
-needs full packet-level padding/splitting, and the public outbound abstraction is
-currently stream-oriented, so UDP behavior is tested at the protocol level.
+The SOCKS5, AnyTLS, and TUIC TCP CONNECT paths are runnable today. UDP associate
+is available through the shared datagram outbound path. AnyTLS still needs full
+packet-level padding/splitting.
 
 ## Run
 

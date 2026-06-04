@@ -6,14 +6,16 @@ use std::{
 use anyhow::{Context, bail};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::Mutex,
 };
 use tracing::{debug, info};
 
 use crate::{
     config::InboundConfig,
+    protocol::socks5::codec,
     router::Router,
-    session::{Command, Session, TargetAddr},
+    session::{BoxDatagram, Command, Session, TargetAddr},
 };
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
@@ -47,20 +49,30 @@ async fn handle(
     router: Arc<Router>,
 ) -> anyhow::Result<()> {
     handshake(&mut inbound, &cfg).await?;
-    let target = read_request(&mut inbound).await?;
-    let session = Session {
-        inbound: cfg.tag,
-        command: Command::Connect,
-        target,
-    };
+    match read_request(&mut inbound).await? {
+        SocksRequest::Connect(target) => {
+            let session = Session {
+                inbound: cfg.tag,
+                command: Command::Connect,
+                target,
+            };
 
-    let mut outbound = router.dial(&session).await?;
-    inbound
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-    debug!(%peer, target = %session.target, "socks5 connected");
-    copy_bidirectional(&mut inbound, &mut outbound).await?;
-    Ok(())
+            let mut outbound = router.dial(&session).await?;
+            write_reply(&mut inbound, 0, TargetAddr::Ip(localhost(0))).await?;
+            debug!(%peer, target = %session.target, "socks5 connected");
+            copy_bidirectional(&mut inbound, &mut outbound).await?;
+            Ok(())
+        }
+        SocksRequest::UdpAssociate(target) => {
+            let session = Session {
+                inbound: cfg.tag,
+                command: Command::UdpAssociate,
+                target,
+            };
+            let outbound = router.dial_udp(&session).await?;
+            handle_udp_associate(inbound, peer, session, outbound).await
+        }
+    }
 }
 
 async fn handshake<S>(stream: &mut S, cfg: &InboundConfig) -> anyhow::Result<()>
@@ -119,7 +131,12 @@ where
     Ok(())
 }
 
-async fn read_request<S>(stream: &mut S) -> anyhow::Result<TargetAddr>
+enum SocksRequest {
+    Connect(TargetAddr),
+    UdpAssociate(TargetAddr),
+}
+
+async fn read_request<S>(stream: &mut S) -> anyhow::Result<SocksRequest>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -129,19 +146,16 @@ where
     if ver != 0x05 || rsv != 0 {
         bail!("invalid socks5 request");
     }
-    if cmd != 0x01 {
-        bail!("only CONNECT is supported in the MVP");
-    }
 
     let atyp = stream.read_u8().await?;
     let target = match atyp {
-        0x01 => {
+        codec::ATYP_IPV4 => {
             let mut octets = [0; 4];
             stream.read_exact(&mut octets).await?;
             let port = stream.read_u16().await?;
             TargetAddr::from((IpAddr::V4(Ipv4Addr::from(octets)), port))
         }
-        0x03 => {
+        codec::ATYP_DOMAIN => {
             let len = stream.read_u8().await? as usize;
             let mut host = vec![0; len];
             stream.read_exact(&mut host).await?;
@@ -151,7 +165,7 @@ where
                 port,
             }
         }
-        0x04 => {
+        codec::ATYP_IPV6 => {
             let mut octets = [0; 16];
             stream.read_exact(&mut octets).await?;
             let port = stream.read_u16().await?;
@@ -159,5 +173,102 @@ where
         }
         other => bail!("unsupported address type {other}"),
     };
-    Ok(target)
+    match cmd {
+        codec::CMD_CONNECT => Ok(SocksRequest::Connect(target)),
+        codec::CMD_UDP_ASSOCIATE => Ok(SocksRequest::UdpAssociate(target)),
+        other => bail!("unsupported socks5 command {other}"),
+    }
+}
+
+async fn write_reply<S>(stream: &mut S, status: u8, bind: TargetAddr) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&[codec::VERSION, status, 0]).await?;
+    stream.write_all(&codec::encode_addr(&bind)?).await?;
+    Ok(())
+}
+
+async fn handle_udp_associate(
+    mut control: TcpStream,
+    peer: SocketAddr,
+    session: Session,
+    outbound: BoxDatagram,
+) -> anyhow::Result<()> {
+    let bind = udp_bind_addr(control.local_addr()?);
+    let socket = Arc::new(UdpSocket::bind(bind).await?);
+    let reply = TargetAddr::Ip(udp_reply_addr(control.local_addr()?, socket.local_addr()?));
+    write_reply(&mut control, 0, reply.clone()).await?;
+    debug!(%peer, bind = %reply, "socks5 udp associated");
+
+    let client_addr = Arc::new(Mutex::new(None));
+    let recv_socket = socket.clone();
+    let recv_client_addr = client_addr.clone();
+    let recv_outbound = outbound.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((source, payload)) = recv_outbound.recv_from().await else {
+                break;
+            };
+            let Some(client) = *recv_client_addr.lock().await else {
+                continue;
+            };
+            let Ok(packet) = codec::encode_udp_packet(&source, &payload) else {
+                continue;
+            };
+            if recv_socket.send_to(&packet, client).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut control_buf = [0; 1];
+    let mut udp_buf = vec![0; 64 * 1024];
+    loop {
+        tokio::select! {
+            read = control.read(&mut control_buf) => {
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            received = socket.recv_from(&mut udp_buf) => {
+                let (read, client) = received?;
+                {
+                    let mut known = client_addr.lock().await;
+                    if known.is_none() {
+                        *known = Some(client);
+                    }
+                    if *known != Some(client) {
+                        continue;
+                    }
+                }
+                match codec::decode_udp_packet(&udp_buf[..read]) {
+                    Ok((target, payload)) => {
+                        debug!(target = %target, inbound = %session.inbound, "socks5 udp packet");
+                        outbound.send_to(&target, &payload).await?;
+                    }
+                    Err(err) => debug!(%err, "invalid socks5 udp packet"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn localhost(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+fn udp_bind_addr(control_addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(control_addr.ip(), 0)
+}
+
+fn udp_reply_addr(control_addr: SocketAddr, udp_addr: SocketAddr) -> SocketAddr {
+    let ip = if udp_addr.ip().is_unspecified() {
+        control_addr.ip()
+    } else {
+        udp_addr.ip()
+    };
+    SocketAddr::new(ip, udp_addr.port())
 }

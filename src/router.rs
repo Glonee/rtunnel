@@ -9,12 +9,17 @@ use crate::{
         anytls::outbound::AnytlsOutbound, direct::outbound::DirectOutbound,
         socks5::outbound::Socks5Outbound, tuic::outbound::TuicOutbound,
     },
-    session::{BoxStream, Session},
+    session::{BoxDatagram, BoxStream, Session},
 };
 
 #[async_trait]
 pub trait Outbound: Send + Sync {
     async fn dial(&self, session: &Session) -> anyhow::Result<BoxStream>;
+
+    async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
+        let _ = session;
+        bail!("udp is not supported by this outbound")
+    }
 }
 
 pub struct Router {
@@ -38,6 +43,15 @@ impl Router {
             .get(tag)
             .with_context(|| format!("unknown outbound {tag}"))?;
         outbound.dial(session).await
+    }
+
+    pub async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
+        let tag = self.pick_outbound(session)?;
+        let outbound = self
+            .outbounds
+            .get(tag)
+            .with_context(|| format!("unknown outbound {tag}"))?;
+        outbound.dial_udp(session).await
     }
 
     fn pick_outbound(&self, session: &Session) -> anyhow::Result<&str> {

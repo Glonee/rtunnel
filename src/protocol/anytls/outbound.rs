@@ -19,7 +19,7 @@ use crate::{
     config::OutboundConfig,
     protocol::anytls::codec,
     router::Outbound,
-    session::{BoxStream, Command, Session},
+    session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
     tls,
 };
 
@@ -43,6 +43,14 @@ impl AnytlsOutbound {
             state: Arc::new(Mutex::new(ClientState::default())),
             session: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn clone_client(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            state: self.state.clone(),
+            session: self.session.clone(),
+        }
     }
 
     async fn session(&self) -> anyhow::Result<Arc<ClientSession>> {
@@ -171,6 +179,20 @@ impl Outbound for AnytlsOutbound {
 
         Ok(Box::new(client_side))
     }
+
+    async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
+        anyhow::ensure!(
+            matches!(session.command, Command::UdpAssociate),
+            "anytls udp outbound only supports UDP associate"
+        );
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        Ok(Arc::new(AnytlsUdpSession {
+            client: self.clone_client(),
+            streams: Mutex::new(HashMap::new()),
+            response_tx,
+            response_rx: Mutex::new(response_rx),
+        }))
+    }
 }
 
 type TlsReadHalf = ReadHalf<SslStream<TcpStream>>;
@@ -283,4 +305,83 @@ impl ClientSession {
         self.close();
         self.streams.lock().await.clear();
     }
+}
+
+struct AnytlsUdpSession {
+    client: AnytlsOutbound,
+    streams: Mutex<HashMap<TargetAddr, mpsc::UnboundedSender<Vec<u8>>>>,
+    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    response_rx: Mutex<mpsc::UnboundedReceiver<(TargetAddr, Vec<u8>)>>,
+}
+
+#[async_trait]
+impl ProxyDatagram for AnytlsUdpSession {
+    async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()> {
+        let tx = {
+            let mut streams = self.streams.lock().await;
+            if let Some(tx) = streams.get(target) {
+                tx.clone()
+            } else {
+                let (tx, rx) = mpsc::unbounded_channel();
+                streams.insert(target.clone(), tx.clone());
+                spawn_uot_stream(
+                    self.client.clone_client(),
+                    target.clone(),
+                    rx,
+                    self.response_tx.clone(),
+                );
+                tx
+            }
+        };
+        tx.send(payload.to_vec())?;
+        Ok(())
+    }
+
+    async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)> {
+        let mut rx = self.response_rx.lock().await;
+        rx.recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("anytls udp session closed"))
+    }
+}
+
+fn spawn_uot_stream(
+    client: AnytlsOutbound,
+    target: TargetAddr,
+    mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+) {
+    tokio::spawn(async move {
+        let result: anyhow::Result<()> = async {
+            let session = Session {
+                inbound: "anytls-udp-out".to_owned(),
+                command: Command::Connect,
+                target: codec::uot_v2_magic_target(),
+            };
+            let stream = client.dial(&session).await?;
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            codec::write_uot_v2_request(&mut writer, true, &target).await?;
+
+            loop {
+                tokio::select! {
+                    payload = payload_rx.recv() => {
+                        let Some(payload) = payload else {
+                            break;
+                        };
+                        codec::write_uot_payload(&mut writer, &payload).await?;
+                    }
+                    payload = codec::read_uot_payload(&mut reader) => {
+                        let payload = payload?;
+                        let _ = response_tx.send((target.clone(), payload));
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            tracing::debug!(%err, target = %target, "anytls udp stream failed");
+        }
+    });
 }

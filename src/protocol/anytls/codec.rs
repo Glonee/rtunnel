@@ -19,6 +19,7 @@ pub const CMD_SYNACK: u8 = 7;
 pub const CMD_HEART_REQUEST: u8 = 8;
 pub const CMD_HEART_RESPONSE: u8 = 9;
 pub const CMD_SERVER_SETTINGS: u8 = 10;
+pub const UOT_V2_MAGIC_HOST: &str = "sp.v2.udp-over-tcp.arpa";
 const PASSWORD_HASH_LEN: usize = 32;
 pub const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
 pub const DEFAULT_PADDING_SCHEME: &str = "\
@@ -152,6 +153,106 @@ where
     stream.write_u16(data.len() as u16).await?;
     stream.write_all(data).await?;
     Ok(())
+}
+
+pub async fn write_uot_v2_request<S>(
+    stream: &mut S,
+    connect: bool,
+    target: &TargetAddr,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_u8(u8::from(connect)).await?;
+    stream.write_all(&encode_uot_addr(target)?).await?;
+    Ok(())
+}
+
+pub async fn write_uot_payload<S>(stream: &mut S, payload: &[u8]) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&encode_uot_payload(payload)?).await?;
+    Ok(())
+}
+
+pub fn encode_uot_payload(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        payload.len() <= u16::MAX as usize,
+        "uot packet is too large"
+    );
+    let mut output = Vec::with_capacity(2 + payload.len());
+    output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
+pub fn encode_uot_packet(target: &TargetAddr, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        payload.len() <= u16::MAX as usize,
+        "uot packet is too large"
+    );
+    let mut output = Vec::with_capacity(259 + 2 + payload.len());
+    output.extend_from_slice(&encode_uot_packet_addr(target)?);
+    output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
+pub fn encode_uot_addr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
+    encode_socksaddr(target)
+}
+
+pub fn encode_uot_packet_addr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    match target {
+        TargetAddr::Ip(addr) if addr.is_ipv4() => {
+            output.push(0x00);
+            if let IpAddr::V4(ip) = addr.ip() {
+                output.extend_from_slice(&ip.octets());
+            }
+            output.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        TargetAddr::Ip(addr) => {
+            output.push(0x01);
+            if let IpAddr::V6(ip) = addr.ip() {
+                output.extend_from_slice(&ip.octets());
+            }
+            output.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        TargetAddr::Domain { host, port } => {
+            anyhow::ensure!(host.len() <= 255, "domain is too long");
+            output.push(0x02);
+            output.push(host.len() as u8);
+            output.extend_from_slice(host.as_bytes());
+            output.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    Ok(output)
+}
+
+pub async fn read_uot_payload<S>(stream: &mut S) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let len = stream.read_u16().await? as usize;
+    let mut payload = vec![0; len];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+pub fn uot_v2_magic_target() -> TargetAddr {
+    TargetAddr::Domain {
+        host: UOT_V2_MAGIC_HOST.to_owned(),
+        port: 0,
+    }
+}
+
+pub fn is_uot_v2_magic_target(target: &TargetAddr) -> bool {
+    matches!(
+        target,
+        TargetAddr::Domain { host, port } if host.eq_ignore_ascii_case(UOT_V2_MAGIC_HOST) && *port == 0
+    )
 }
 
 pub fn settings() -> &'static [u8] {
@@ -329,6 +430,25 @@ mod tests {
 
         assert_eq!(target.to_string(), "127.0.0.1:19000");
         assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn encodes_uot_non_connect_packet_addr() {
+        let raw = encode_uot_packet(
+            &TargetAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                19000,
+            )),
+            b"ping",
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw,
+            vec![
+                0x00, 127, 0, 0, 1, 0x4a, 0x38, 0x00, 0x04, b'p', b'i', b'n', b'g'
+            ]
+        );
     }
 
     #[test]

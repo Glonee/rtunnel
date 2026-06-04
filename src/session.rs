@@ -1,8 +1,10 @@
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
@@ -10,6 +12,15 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 
 pub type BoxStream = Box<dyn ProxyStream>;
+
+#[async_trait]
+pub trait ProxyDatagram: Send + Sync {
+    async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()>;
+
+    async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)>;
+}
+
+pub type BoxDatagram = Arc<dyn ProxyDatagram>;
 
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -21,11 +32,10 @@ pub struct Session {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Connect,
-    #[allow(dead_code)]
     UdpAssociate,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum TargetAddr {
     Ip(SocketAddr),
     Domain { host: String, port: u16 },

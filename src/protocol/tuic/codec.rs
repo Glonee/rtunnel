@@ -13,9 +13,7 @@ use crate::session::TargetAddr;
 pub const VERSION: u8 = 0x05;
 pub const CMD_AUTHENTICATE: u8 = 0x00;
 pub const CMD_CONNECT: u8 = 0x01;
-#[allow(dead_code)]
 pub const CMD_PACKET: u8 = 0x02;
-#[allow(dead_code)]
 pub const CMD_DISSOCIATE: u8 = 0x03;
 pub const CMD_HEARTBEAT: u8 = 0x04;
 pub const TOKEN_LEN: usize = 32;

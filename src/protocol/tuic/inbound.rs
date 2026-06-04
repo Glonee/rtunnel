@@ -15,14 +15,14 @@ use tokio_quiche::{
     metrics::DefaultMetrics,
     quic::{HandshakeInfo, QuicheConnection},
     quiche,
-    settings::{CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths},
+    settings::{CertificateKind, ConnectionParams, Hooks, TlsCertificatePaths},
 };
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
     config::{InboundConfig, UserConfig},
-    protocol::tuic::codec,
+    protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
     router::Router,
     session::{Command, Session, TargetAddr},
 };
@@ -42,8 +42,7 @@ pub async fn serve(
         .as_ref()
         .context("tuic inbound requires tls config")?;
     let users = parse_users(cfg.users.as_deref().unwrap_or_default())?;
-    let mut settings = QuicSettings::default();
-    settings.alpn = vec![b"h3".to_vec()];
+    let mut settings = quic_settings();
     settings.verify_peer = false;
     settings.disable_client_ip_validation = true;
     let params = ConnectionParams::new_server(
@@ -332,6 +331,13 @@ impl TuicApp {
             let Some(target) = packet.target.clone() else {
                 return Err(anyhow::anyhow!("tuic packet is missing target").into());
             };
+            debug!(
+                assoc_id = packet.assoc_id,
+                mode = ?mode,
+                target = %target,
+                payload_len = packet.payload.len(),
+                "tuic udp packet received"
+            );
             let session = self.udp_sessions.entry(packet.assoc_id).or_insert_with(|| {
                 spawn_udp_session(packet.assoc_id, mode, self.outbound_tx.clone())
             });
@@ -366,8 +372,13 @@ impl ApplicationOverQuic for TuicApp {
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
         if self.pending_writes.is_empty() {
-            if let Some(write) = self.outbound_rx.recv().await {
-                self.pending_writes.push_back(write);
+            tokio::select! {
+                write = self.outbound_rx.recv() => {
+                    if let Some(write) = write {
+                        self.pending_writes.push_back(write);
+                    }
+                }
+                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
             }
         }
         Ok(())
@@ -476,11 +487,7 @@ impl ApplicationOverQuic for TuicApp {
                 QuicWrite::Close { stream_id } => {
                     match qconn.stream_send(stream_id, &[], true) {
                         Ok(_) => {}
-                        Err(quiche::Error::Done) => {
-                            self.pending_writes
-                                .push_front(QuicWrite::Close { stream_id });
-                            break;
-                        }
+                        Err(quiche::Error::Done) => {}
                         Err(_) => {}
                     }
                     self.streams.remove(&stream_id);
@@ -587,6 +594,13 @@ async fn run_udp_session(
                     target: Some(TargetAddr::Ip(source)),
                     payload: buf[..read].to_vec(),
                 };
+                debug!(
+                    assoc_id,
+                    mode = ?mode,
+                    source = %source,
+                    payload_len = read,
+                    "tuic udp packet sending response"
+                );
                 let encoded = codec::encode_packet(&packet)?;
                 let write = match mode {
                     UdpMode::Native => QuicWrite::Datagram(encoded),

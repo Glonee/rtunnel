@@ -74,6 +74,24 @@ async fn socks5_outbound_authenticates_to_socks5_inbound() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn socks5_udp_reaches_socks5_inbound() -> anyhow::Result<()> {
+    let echo_addr = spawn_udp_echo_server().await?;
+    let inbound_addr = spawn_socks5_inbound(None).await?;
+    let client = Socks5Outbound::new(OutboundConfig {
+        tag: "client".to_owned(),
+        protocol: Protocol::Socks5,
+        server: Some(inbound_addr),
+        server_name: None,
+        insecure: false,
+        username: None,
+        password: None,
+        uuid: None,
+    })?;
+
+    assert_udp_roundtrip(client, echo_addr).await
+}
+
+#[tokio::test]
 async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_echo_server().await?;
     let inbound_addr = spawn_anytls_inbound().await?;
@@ -89,6 +107,24 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
+}
+
+#[tokio::test]
+async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
+    let echo_addr = spawn_udp_echo_server().await?;
+    let inbound_addr = spawn_anytls_inbound().await?;
+    let client = AnytlsOutbound::new(OutboundConfig {
+        tag: "client".to_owned(),
+        protocol: Protocol::Anytls,
+        server: Some(inbound_addr),
+        server_name: Some("localhost".to_owned()),
+        insecure: true,
+        username: None,
+        password: Some("secret".to_owned()),
+        uuid: None,
+    })?;
+
+    assert_udp_roundtrip(client, echo_addr).await
 }
 
 #[tokio::test]
@@ -207,6 +243,24 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn tuic_udp_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
+    let echo_addr = spawn_udp_echo_server().await?;
+    let inbound_addr = spawn_tuic_inbound().await?;
+    let client = TuicOutbound::new(OutboundConfig {
+        tag: "client".to_owned(),
+        protocol: Protocol::Tuic,
+        server: Some(inbound_addr),
+        server_name: Some("localhost".to_owned()),
+        insecure: true,
+        username: None,
+        password: Some("secret".to_owned()),
+        uuid: Some(TUIC_UUID.to_owned()),
+    })?;
+
+    assert_udp_roundtrip(client, echo_addr).await
+}
+
+#[tokio::test]
 async fn tuic_native_udp_reaches_udp_echo() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
     let inbound_addr = spawn_tuic_inbound().await?;
@@ -244,6 +298,29 @@ where
     timeout(Duration::from_secs(5), stream.read_exact(&mut received)).await??;
 
     assert_eq!(&received, b"ping");
+    Ok(())
+}
+
+async fn assert_udp_roundtrip<C>(client: C, echo_addr: SocketAddr) -> anyhow::Result<()>
+where
+    C: Outbound,
+{
+    let session = Session {
+        inbound: "test-client".to_owned(),
+        command: Command::UdpAssociate,
+        target: TargetAddr::Ip(echo_addr),
+    };
+    let udp = timeout(Duration::from_secs(5), client.dial_udp(&session)).await??;
+
+    timeout(
+        Duration::from_secs(5),
+        udp.send_to(&TargetAddr::Ip(echo_addr), b"ping"),
+    )
+    .await??;
+    let (source, received) = timeout(Duration::from_secs(5), udp.recv_from()).await??;
+
+    assert_eq!(source, TargetAddr::Ip(echo_addr));
+    assert_eq!(received, b"ping");
     Ok(())
 }
 

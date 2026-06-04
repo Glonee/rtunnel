@@ -1,4 +1,10 @@
-use std::collections::VecDeque;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use tokio::{
@@ -11,7 +17,7 @@ use tokio_quiche::{
     ApplicationOverQuic, QuicResult,
     quic::{HandshakeInfo, QuicheConnection, connect_with_config},
     quiche,
-    settings::{ConnectionParams, Hooks, QuicSettings},
+    settings::{ConnectionParams, Hooks},
     socket::Socket,
 };
 use tracing::debug;
@@ -19,9 +25,9 @@ use uuid::Uuid;
 
 use crate::{
     config::OutboundConfig,
-    protocol::tuic::codec,
+    protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
     router::Outbound,
-    session::{BoxStream, Command, Session, TargetAddr},
+    session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
 };
 
 const CONNECT_STREAM_ID: u64 = 0;
@@ -81,8 +87,7 @@ impl Outbound for TuicOutbound {
         socket.connect(server).await?;
         let socket = Socket::try_from(socket)?;
 
-        let mut settings = QuicSettings::default();
-        settings.alpn = vec![b"h3".to_vec()];
+        let mut settings = quic_settings();
         settings.verify_peer = !self.cfg.insecure;
         let params = ConnectionParams::new_client(settings, None, Hooks::default());
 
@@ -135,6 +140,48 @@ impl Outbound for TuicOutbound {
         );
 
         Ok(Box::new(client_side))
+    }
+
+    async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
+        anyhow::ensure!(
+            matches!(session.command, Command::UdpAssociate),
+            "tuic udp outbound only supports UDP associate"
+        );
+
+        let server = self.cfg.require_server()?;
+        let server_name = self
+            .cfg
+            .server_name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| server.ip().to_string());
+        let socket = UdpSocket::bind(if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?;
+        socket.connect(server).await?;
+        let socket = Socket::try_from(socket)?;
+
+        let mut settings = quic_settings();
+        settings.verify_peer = !self.cfg.insecure;
+        let params = ConnectionParams::new_client(settings, None, Hooks::default());
+
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let app = TuicUdpOutboundApp::new(self.uuid, self.password.clone(), write_rx, response_tx);
+        connect_with_config(socket, Some(server_name.as_str()), &params, app)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("tuic udp outbound {} handshake failed: {err}", self.cfg.tag)
+            })?;
+
+        Ok(Arc::new(TuicUdpSession {
+            write_tx,
+            response_rx: tokio::sync::Mutex::new(response_rx),
+            pkt_id: AtomicU16::new(1),
+        }))
     }
 }
 
@@ -235,6 +282,7 @@ impl ApplicationOverQuic for TuicClientApp {
                     self.pending_writes.push_back(QuicWrite::Heartbeat);
                     self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
                 }
+                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
             }
         }
         Ok(())
@@ -296,12 +344,195 @@ impl ApplicationOverQuic for TuicClientApp {
                 }
                 QuicWrite::Close => match qconn.stream_send(CONNECT_STREAM_ID, &[], true) {
                     Ok(_) => {}
-                    Err(quiche::Error::Done) => {
-                        self.pending_writes.push_front(QuicWrite::Close);
-                        break;
-                    }
+                    Err(quiche::Error::Done) => {}
                     Err(_) => {}
                 },
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TuicUdpSession {
+    write_tx: mpsc::UnboundedSender<TuicUdpWrite>,
+    response_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(TargetAddr, Vec<u8>)>>,
+    pkt_id: AtomicU16,
+}
+
+#[async_trait]
+impl ProxyDatagram for TuicUdpSession {
+    async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()> {
+        let packet = codec::Packet {
+            assoc_id: 1,
+            pkt_id: self.pkt_id.fetch_add(1, Ordering::SeqCst),
+            frag_total: 1,
+            frag_id: 0,
+            target: Some(target.clone()),
+            payload: payload.to_vec(),
+        };
+        self.write_tx.send(TuicUdpWrite::Packet(packet))?;
+        Ok(())
+    }
+
+    async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)> {
+        let mut rx = self.response_rx.lock().await;
+        rx.recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("tuic udp session closed"))
+    }
+}
+
+enum TuicUdpWrite {
+    Packet(codec::Packet),
+    Heartbeat,
+}
+
+struct TuicUdpOutboundApp {
+    uuid: Uuid,
+    password: String,
+    outbound_rx: mpsc::UnboundedReceiver<TuicUdpWrite>,
+    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    pending_writes: VecDeque<TuicUdpWrite>,
+    packet_assembler: codec::PacketAssembler,
+    stream_buffers: HashMap<u64, Vec<u8>>,
+    next_heartbeat: Instant,
+    buffer: [u8; 16 * 1024],
+}
+
+impl TuicUdpOutboundApp {
+    fn new(
+        uuid: Uuid,
+        password: String,
+        outbound_rx: mpsc::UnboundedReceiver<TuicUdpWrite>,
+        response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            uuid,
+            password,
+            outbound_rx,
+            response_tx,
+            pending_writes: VecDeque::new(),
+            packet_assembler: codec::PacketAssembler::default(),
+            stream_buffers: HashMap::new(),
+            next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
+            buffer: [0; 16 * 1024],
+        }
+    }
+
+    fn handle_packet(&mut self, data: &[u8]) -> QuicResult<()> {
+        let packet = codec::parse_packet(data)?;
+        if let Some(packet) = self.packet_assembler.push(packet)? {
+            let Some(source) = packet.target else {
+                return Err(anyhow::anyhow!("tuic udp response missing source").into());
+            };
+            let _ = self.response_tx.send((source, packet.payload));
+        }
+        Ok(())
+    }
+}
+
+impl ApplicationOverQuic for TuicUdpOutboundApp {
+    fn on_conn_established(
+        &mut self,
+        qconn: &mut QuicheConnection,
+        _handshake_info: &HandshakeInfo,
+    ) -> QuicResult<()> {
+        let token = codec::token(qconn.as_mut(), self.uuid, &self.password)?;
+        let mut auth = Vec::with_capacity(codec::AUTHENTICATE_LEN);
+        auth.push(codec::VERSION);
+        auth.push(codec::CMD_AUTHENTICATE);
+        auth.extend_from_slice(self.uuid.as_bytes());
+        auth.extend_from_slice(&token);
+        qconn.stream_send(AUTH_STREAM_ID, &auth, true)?;
+        Ok(())
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+
+    fn buffer(&mut self) -> &mut [u8] {
+        &mut self.buffer
+    }
+
+    async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
+        if self.pending_writes.is_empty() {
+            tokio::select! {
+                write = self.outbound_rx.recv() => {
+                    if let Some(write) = write {
+                        self.pending_writes.push_back(write);
+                    }
+                }
+                _ = tokio::time::sleep_until(self.next_heartbeat) => {
+                    self.pending_writes.push_back(TuicUdpWrite::Heartbeat);
+                    self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+                }
+                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        let mut dgram = [0; 64 * 1024];
+        while let Ok(read) = qconn.dgram_recv(&mut dgram) {
+            if read >= 2 && dgram[0] == codec::VERSION && dgram[1] == codec::CMD_PACKET {
+                self.handle_packet(&dgram[..read])?;
+            }
+        }
+
+        while let Some(stream_id) = qconn.stream_readable_next() {
+            loop {
+                let mut buf = [0; 16 * 1024];
+                match qconn.stream_recv(stream_id, &mut buf) {
+                    Ok((read, fin)) => {
+                        self.stream_buffers
+                            .entry(stream_id)
+                            .or_default()
+                            .extend_from_slice(&buf[..read]);
+                        if fin {
+                            if let Some(data) = self.stream_buffers.remove(&stream_id) {
+                                self.handle_packet(&data)?;
+                            }
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(err) => return Err(Box::new(err)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        while let Ok(write) = self.outbound_rx.try_recv() {
+            self.pending_writes.push_back(write);
+        }
+
+        while let Some(write) = self.pending_writes.pop_front() {
+            match write {
+                TuicUdpWrite::Packet(packet) => {
+                    let data = codec::encode_packet(&packet)?;
+                    match qconn.dgram_send(&data) {
+                        Ok(_) => {}
+                        Err(quiche::Error::Done) => {
+                            self.pending_writes.push_front(TuicUdpWrite::Packet(packet));
+                            break;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
+                TuicUdpWrite::Heartbeat => {
+                    match qconn.dgram_send(&[codec::VERSION, codec::CMD_HEARTBEAT]) {
+                        Ok(_) => {}
+                        Err(quiche::Error::Done) => {
+                            self.pending_writes.push_front(TuicUdpWrite::Heartbeat);
+                            break;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
             }
         }
         Ok(())

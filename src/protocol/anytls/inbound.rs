@@ -1,10 +1,14 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, mpsc},
 };
 use tokio_boring::{SslStream, accept};
 use tracing::{debug, info};
@@ -13,7 +17,7 @@ use crate::{
     config::InboundConfig,
     protocol::anytls::codec,
     router::Router,
-    session::{BoxStream, Command, Session},
+    session::{BoxDatagram, BoxStream, Command, Session, TargetAddr},
     tls,
 };
 
@@ -61,7 +65,8 @@ pub async fn serve(
                 let username = codec::read_client_hello(&mut tls_stream, users).await?;
                 let (mut reader, writer) = tokio::io::split(tls_stream);
                 let writer = Arc::new(Mutex::new(writer));
-                let mut streams: HashMap<u32, WriteHalf<BoxStream>> = HashMap::new();
+                let mut streams: HashMap<u32, InboundStream> = HashMap::new();
+                let mut synacked_streams: HashSet<u32> = HashSet::new();
                 let mut settings_seen = false;
                 let mut client_v2 = false;
 
@@ -99,6 +104,10 @@ pub async fn serve(
                                     .await?;
                                 anyhow::bail!("anytls stream opened before settings");
                             }
+                            if client_v2 && synacked_streams.insert(frame.stream_id) {
+                                write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[])
+                                    .await?;
+                            }
                         }
                         codec::CMD_PSH => {
                             if !settings_seen {
@@ -107,11 +116,38 @@ pub async fn serve(
                                 anyhow::bail!("anytls data sent before settings");
                             }
                             if let Some(stream) = streams.get_mut(&frame.stream_id) {
-                                stream.write_all(&frame.data).await?;
+                                match stream {
+                                    InboundStream::Tcp(stream) => {
+                                        stream.write_all(&frame.data).await?;
+                                    }
+                                    InboundStream::Udp(tx) => {
+                                        let _ = tx.send(frame.data);
+                                    }
+                                }
                                 continue;
                             }
 
                             let (target, consumed) = codec::decode_socksaddr(&frame.data)?;
+                            if codec::is_uot_v2_magic_target(&target) {
+                                let (tx, rx) = mpsc::unbounded_channel();
+                                if consumed < frame.data.len() {
+                                    let _ = tx.send(frame.data[consumed..].to_vec());
+                                }
+                                streams.insert(frame.stream_id, InboundStream::Udp(tx));
+                                if client_v2 && synacked_streams.insert(frame.stream_id) {
+                                    write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[])
+                                        .await?;
+                                }
+                                spawn_uot_reader(
+                                    frame.stream_id,
+                                    cfg.tag.clone(),
+                                    rx,
+                                    router.clone(),
+                                    writer.clone(),
+                                );
+                                continue;
+                            }
+
                             let session = Session {
                                 inbound: cfg.tag.clone(),
                                 command: Command::Connect,
@@ -123,8 +159,8 @@ pub async fn serve(
                             if consumed < frame.data.len() {
                                 write_half.write_all(&frame.data[consumed..]).await?;
                             }
-                            streams.insert(frame.stream_id, write_half);
-                            if client_v2 {
+                            streams.insert(frame.stream_id, InboundStream::Tcp(write_half));
+                            if client_v2 && synacked_streams.insert(frame.stream_id) {
                                 write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[])
                                     .await?;
                             }
@@ -132,6 +168,7 @@ pub async fn serve(
                         }
                         codec::CMD_FIN => {
                             streams.remove(&frame.stream_id);
+                            synacked_streams.remove(&frame.stream_id);
                         }
                         codec::CMD_WASTE => {}
                         codec::CMD_HEART_REQUEST => {
@@ -170,6 +207,11 @@ where
     write_frame(writer, codec::CMD_ALERT, 0, message.as_bytes()).await
 }
 
+enum InboundStream {
+    Tcp(WriteHalf<BoxStream>),
+    Udp(mpsc::UnboundedSender<Vec<u8>>),
+}
+
 fn spawn_outbound_reader(
     stream_id: u32,
     mut read_half: ReadHalf<BoxStream>,
@@ -198,4 +240,200 @@ fn spawn_outbound_reader(
             }
         }
     });
+}
+
+fn spawn_uot_reader(
+    stream_id: u32,
+    inbound: String,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    router: Arc<Router>,
+    writer: Arc<Mutex<TlsWriteHalf>>,
+) {
+    tokio::spawn(async move {
+        let result = run_uot_stream(stream_id, inbound, rx, router, writer.clone()).await;
+        if let Err(err) = result {
+            debug!(%err, "anytls uot stream failed");
+        }
+        let _ = write_frame(&writer, codec::CMD_FIN, stream_id, &[]).await;
+    });
+}
+
+async fn run_uot_stream(
+    stream_id: u32,
+    inbound: String,
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    router: Arc<Router>,
+    writer: Arc<Mutex<TlsWriteHalf>>,
+) -> anyhow::Result<()> {
+    let mut input = ChunkReader::new(rx);
+    let connect = input.read_u8().await? == 1;
+    let request_target = input.read_socks_target().await?;
+    let session = Session {
+        inbound,
+        command: Command::UdpAssociate,
+        target: request_target.clone(),
+    };
+    let outbound = router.dial_udp(&session).await?;
+    if connect {
+        run_uot_connect_stream(stream_id, request_target, input, outbound, writer).await
+    } else {
+        run_uot_packet_stream(stream_id, input, outbound, writer).await
+    }
+}
+
+async fn run_uot_connect_stream(
+    stream_id: u32,
+    target: TargetAddr,
+    mut input: ChunkReader,
+    outbound: BoxDatagram,
+    writer: Arc<Mutex<TlsWriteHalf>>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            payload = input.read_len_payload() => {
+                let payload = payload?;
+                outbound.send_to(&target, &payload).await?;
+            }
+            received = outbound.recv_from() => {
+                let (_source, payload) = received?;
+                let frame = codec::encode_uot_payload(&payload)?;
+                write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+            }
+        }
+    }
+}
+
+async fn run_uot_packet_stream(
+    stream_id: u32,
+    mut input: ChunkReader,
+    outbound: BoxDatagram,
+    writer: Arc<Mutex<TlsWriteHalf>>,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            packet = input.read_packet() => {
+                let (target, payload) = packet?;
+                outbound.send_to(&target, &payload).await?;
+            }
+            received = outbound.recv_from() => {
+                let (source, payload) = received?;
+                let frame = codec::encode_uot_packet(&source, &payload)?;
+                write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+            }
+        }
+    }
+}
+
+struct ChunkReader {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    buffer: VecDeque<u8>,
+}
+
+impl ChunkReader {
+    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            buffer: VecDeque::new(),
+        }
+    }
+
+    async fn read_u8(&mut self) -> anyhow::Result<u8> {
+        let bytes = self.read_exact(1).await?;
+        Ok(bytes[0])
+    }
+
+    async fn read_u16(&mut self) -> anyhow::Result<u16> {
+        let bytes = self.read_exact(2).await?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    async fn read_len_payload(&mut self) -> anyhow::Result<Vec<u8>> {
+        let len = self.read_u16().await? as usize;
+        self.read_exact(len).await
+    }
+
+    async fn read_packet(&mut self) -> anyhow::Result<(TargetAddr, Vec<u8>)> {
+        let target = self.read_uot_packet_target().await?;
+        let payload = self.read_len_payload().await?;
+        Ok((target, payload))
+    }
+
+    async fn read_socks_target(&mut self) -> anyhow::Result<TargetAddr> {
+        let atyp = self.read_u8().await?;
+        match atyp {
+            0x01 => {
+                let bytes = self.read_exact(6).await?;
+                let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+                let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+                Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port)))
+            }
+            0x02 => {
+                let len = self.read_u8().await?;
+                let bytes = self.read_exact(len as usize + 2).await?;
+                let host = String::from_utf8(bytes[..len as usize].to_vec())?;
+                let port = u16::from_be_bytes([bytes[len as usize], bytes[len as usize + 1]]);
+                Ok(TargetAddr::Domain { host, port })
+            }
+            0x03 => {
+                let len = self.read_u8().await?;
+                let bytes = self.read_exact(len as usize + 2).await?;
+                let host = String::from_utf8(bytes[..len as usize].to_vec())?;
+                let port = u16::from_be_bytes([bytes[len as usize], bytes[len as usize + 1]]);
+                Ok(TargetAddr::Domain { host, port })
+            }
+            0x04 => {
+                let bytes = self.read_exact(18).await?;
+                let mut octets = [0; 16];
+                octets.copy_from_slice(&bytes[..16]);
+                let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+                Ok(TargetAddr::Ip(SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(octets)),
+                    port,
+                )))
+            }
+            other => anyhow::bail!("unsupported uot request address type {other}"),
+        }
+    }
+
+    async fn read_uot_packet_target(&mut self) -> anyhow::Result<TargetAddr> {
+        let atyp = self.read_u8().await?;
+        match atyp {
+            0x00 => {
+                let bytes = self.read_exact(6).await?;
+                let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+                let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+                Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port)))
+            }
+            0x01 => {
+                let bytes = self.read_exact(18).await?;
+                let mut octets = [0; 16];
+                octets.copy_from_slice(&bytes[..16]);
+                let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+                Ok(TargetAddr::Ip(SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(octets)),
+                    port,
+                )))
+            }
+            0x02 => {
+                let len = self.read_u8().await?;
+                let bytes = self.read_exact(len as usize + 2).await?;
+                let host = String::from_utf8(bytes[..len as usize].to_vec())?;
+                let port = u16::from_be_bytes([bytes[len as usize], bytes[len as usize + 1]]);
+                Ok(TargetAddr::Domain { host, port })
+            }
+            other => anyhow::bail!("unsupported uot packet address type {other}"),
+        }
+    }
+
+    async fn read_exact(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
+        while self.buffer.len() < len {
+            let chunk = self
+                .rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("uot stream closed"))?;
+            self.buffer.extend(chunk);
+        }
+        Ok(self.buffer.drain(..len).collect())
+    }
 }
