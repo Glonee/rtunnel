@@ -26,4 +26,5 @@ toml = "0.8.22"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tuic-core = { git = "https://github.com/Itsusinn/tuic", rev = "e38c357a0145a43c901947ca2facf0900f9b7da6", package = "tuic-core", default-features = false, features = ["async_marshal", "marshal", "model"] }
+upstream-anytls = { package = "anytls", version = "0.3.4", default-features = false, features = ["core"] }
 uuid = { version = "1.11.0", features = ["serde", "v4"] }

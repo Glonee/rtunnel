@@ -113,6 +113,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "anytls"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa2a2aec1f81dbaf55cf63b1fc4f8df51de8d9c04d9a5a777b14e3205b9dd355"
+dependencies = [
+ "bytes",
+ "log",
+ "md5 0.8.0",
+ "parking_lot",
+ "rand 0.10.1",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1657,6 +1670,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
+name = "md5"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2415,6 +2434,7 @@ name = "rtunel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "anytls",
  "async-trait",
  "base64",
  "boring",
@@ -2424,7 +2444,7 @@ dependencies = [
  "foreign-types",
  "futures-util",
  "hex",
- "md5",
+ "md5 0.7.0",
  "serde",
  "sha2",
  "tokio",

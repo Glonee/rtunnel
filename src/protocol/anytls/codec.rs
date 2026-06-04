@@ -3,25 +3,28 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use boring::rand::rand_bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use upstream_anytls::core::{
+    Command as CoreCommand, Frame as CoreFrame, HEADER_OVERHEAD_SIZE as CORE_FRAME_HEADER_LEN,
+    PaddingFactory,
+};
 
 use crate::{config::UserConfig, session::TargetAddr};
 
-pub const CMD_WASTE: u8 = 0;
-pub const CMD_SYN: u8 = 1;
-pub const CMD_PSH: u8 = 2;
-pub const CMD_FIN: u8 = 3;
-pub const CMD_SETTINGS: u8 = 4;
-pub const CMD_ALERT: u8 = 5;
-pub const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
-pub const CMD_SYNACK: u8 = 7;
-pub const CMD_HEART_REQUEST: u8 = 8;
-pub const CMD_HEART_RESPONSE: u8 = 9;
-pub const CMD_SERVER_SETTINGS: u8 = 10;
+pub const CMD_WASTE: u8 = command_code(CoreCommand::Waste);
+pub const CMD_SYN: u8 = command_code(CoreCommand::Syn);
+pub const CMD_PSH: u8 = command_code(CoreCommand::Psh);
+pub const CMD_FIN: u8 = command_code(CoreCommand::Fin);
+pub const CMD_SETTINGS: u8 = command_code(CoreCommand::Settings);
+pub const CMD_ALERT: u8 = command_code(CoreCommand::Alert);
+pub const CMD_UPDATE_PADDING_SCHEME: u8 = command_code(CoreCommand::UpdatePaddingScheme);
+pub const CMD_SYNACK: u8 = command_code(CoreCommand::SynAck);
+pub const CMD_HEART_REQUEST: u8 = command_code(CoreCommand::HeartRequest);
+pub const CMD_HEART_RESPONSE: u8 = command_code(CoreCommand::HeartResponse);
+pub const CMD_SERVER_SETTINGS: u8 = command_code(CoreCommand::ServerSettings);
 pub const UOT_V2_MAGIC_HOST: &str = "sp.v2.udp-over-tcp.arpa";
-pub const FRAME_HEADER_LEN: usize = 1 + 4 + 2;
+pub const FRAME_HEADER_LEN: usize = CORE_FRAME_HEADER_LEN;
 const PASSWORD_HASH_LEN: usize = 32;
 pub const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
 pub const DEFAULT_PADDING_SCHEME: &str = "\
@@ -54,10 +57,11 @@ pub enum GeneratedPaddingStep {
     Check,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct PaddingPlan {
     pub stop: u32,
     entries: Vec<(u32, Vec<PaddingStep>)>,
+    factory: PaddingFactory,
 }
 
 pub fn parse_padding_scheme(lines: &[String]) -> anyhow::Result<Vec<PaddingRule>> {
@@ -89,7 +93,9 @@ pub fn parse_padding_scheme(lines: &[String]) -> anyhow::Result<Vec<PaddingRule>
 
 pub fn parse_padding_plan(lines: &[String]) -> anyhow::Result<PaddingPlan> {
     let text = padding_scheme_text(lines);
-    let mut stop = None;
+    let factory = PaddingFactory::new(text.as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("invalid anytls padding scheme"))?;
+    let mut stop: Option<u32> = None;
     let mut entries = Vec::new();
 
     for line in text.lines() {
@@ -135,9 +141,16 @@ pub fn parse_padding_plan(lines: &[String]) -> anyhow::Result<PaddingPlan> {
         entries.push((stage, steps));
     }
 
+    let stop = stop.ok_or_else(|| anyhow::anyhow!("padding scheme missing stop"))?;
+    anyhow::ensure!(
+        stop == factory.stop(),
+        "padding scheme stop does not match upstream parser"
+    );
+
     Ok(PaddingPlan {
-        stop: stop.ok_or_else(|| anyhow::anyhow!("padding scheme missing stop"))?,
+        stop: factory.stop(),
         entries,
+        factory,
     })
 }
 
@@ -146,18 +159,16 @@ impl PaddingPlan {
         &self,
         packet: u32,
     ) -> anyhow::Result<Vec<GeneratedPaddingStep>> {
-        let Some((_, steps)) = self.entries.iter().find(|(stage, _)| *stage == packet) else {
-            return Ok(Vec::new());
-        };
-        steps
-            .iter()
-            .map(|step| match step {
-                PaddingStep::Check => Ok(GeneratedPaddingStep::Check),
-                PaddingStep::Size { min, max } => {
-                    Ok(GeneratedPaddingStep::Size(random_range(*min, *max)?))
-                }
+        Ok(self
+            .factory
+            .generate_record_payload_sizes(packet)
+            .into_iter()
+            .filter_map(|size| match size {
+                upstream_anytls::core::CHECK_MARK => Some(GeneratedPaddingStep::Check),
+                size if size > 0 => Some(GeneratedPaddingStep::Size(size as usize)),
+                _ => None,
             })
-            .collect()
+            .collect())
     }
 
     pub fn steps_for_packet(&self, packet: u32) -> Option<&[PaddingStep]> {
@@ -225,18 +236,16 @@ pub async fn read_frame<S>(stream: &mut S) -> anyhow::Result<Frame>
 where
     S: AsyncRead + Unpin,
 {
-    let command = stream.read_u8().await?;
-    let stream_id = stream.read_u32().await?;
-    let len = stream.read_u16().await? as usize;
-    let mut data = vec![0; len];
+    let mut raw = vec![0; FRAME_HEADER_LEN];
+    stream.read_exact(&mut raw).await?;
+    let len = u16::from_be_bytes([raw[5], raw[6]]) as usize;
     if len > 0 {
-        stream.read_exact(&mut data).await?;
+        raw.resize(FRAME_HEADER_LEN + len, 0);
+        stream.read_exact(&mut raw[FRAME_HEADER_LEN..]).await?;
     }
-    Ok(Frame {
-        command,
-        stream_id,
-        data,
-    })
+    let frame =
+        CoreFrame::from_bytes(&raw).ok_or_else(|| anyhow::anyhow!("invalid anytls frame"))?;
+    Ok(Frame::from(frame))
 }
 
 pub async fn write_frame<S>(
@@ -256,12 +265,11 @@ where
 
 pub fn encode_frame(command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(data.len() <= u16::MAX as usize, "anytls frame is too large");
-    let mut output = Vec::with_capacity(FRAME_HEADER_LEN + data.len());
-    output.push(command);
-    output.extend_from_slice(&stream_id.to_be_bytes());
-    output.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    output.extend_from_slice(data);
-    Ok(output)
+    Ok(
+        CoreFrame::with_data(command.into(), stream_id, data.to_vec().into())
+            .to_bytes()
+            .to_vec(),
+    )
 }
 
 pub fn encode_waste_frame(data_len: usize) -> anyhow::Result<Vec<u8>> {
@@ -455,7 +463,9 @@ pub fn padding_scheme_md5(lines: &[String]) -> String {
     if lines.is_empty() {
         DEFAULT_PADDING_MD5.to_owned()
     } else {
-        format!("{:x}", md5::compute(padding_scheme_text(lines).as_bytes()))
+        PaddingFactory::new(padding_scheme_text(lines).as_bytes())
+            .map(|factory| factory.md5().to_owned())
+            .unwrap_or_else(|| format!("{:x}", md5::compute(padding_scheme_text(lines).as_bytes())))
     }
 }
 
@@ -551,20 +561,29 @@ fn read_u16(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u16> {
     Ok(u16::from_be_bytes(buf))
 }
 
-fn random_range(min: u16, max: u16) -> anyhow::Result<usize> {
-    if min == max {
-        return Ok(min as usize);
+const fn command_code(command: CoreCommand) -> u8 {
+    match command {
+        CoreCommand::Waste => 0,
+        CoreCommand::Syn => 1,
+        CoreCommand::Psh => 2,
+        CoreCommand::Fin => 3,
+        CoreCommand::Settings => 4,
+        CoreCommand::Alert => 5,
+        CoreCommand::UpdatePaddingScheme => 6,
+        CoreCommand::SynAck => 7,
+        CoreCommand::HeartRequest => 8,
+        CoreCommand::HeartResponse => 9,
+        CoreCommand::ServerSettings => 10,
+        CoreCommand::Unknown(value) => value,
     }
-    let span = u128::from(max - min);
-    let sample_space = 1u128 << 64;
-    let limit = sample_space - (sample_space % span);
+}
 
-    loop {
-        let mut bytes = [0; 8];
-        rand_bytes(&mut bytes)?;
-        let value = u128::from(u64::from_be_bytes(bytes));
-        if value < limit {
-            return Ok((u128::from(min) + value % span) as usize);
+impl From<CoreFrame> for Frame {
+    fn from(frame: CoreFrame) -> Self {
+        Self {
+            command: frame.cmd.into(),
+            stream_id: frame.sid,
+            data: frame.data.to_vec(),
         }
     }
 }
@@ -662,6 +681,20 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].len(), 20);
+    }
+
+    #[test]
+    fn frame_encoding_matches_upstream_core() {
+        let encoded = encode_frame(CMD_PSH, 42, b"hello").unwrap();
+        let upstream = CoreFrame::with_data(CoreCommand::Psh, 42, b"hello".to_vec().into())
+            .to_bytes()
+            .to_vec();
+
+        assert_eq!(encoded, upstream);
+        let parsed = CoreFrame::from_bytes(&encoded).unwrap();
+        assert_eq!(parsed.cmd, CoreCommand::Psh);
+        assert_eq!(parsed.sid, 42);
+        assert_eq!(parsed.data.as_ref(), b"hello");
     }
 
     #[test]
