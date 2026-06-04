@@ -9,7 +9,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::{Mutex, mpsc},
 };
@@ -94,16 +94,18 @@ impl AnytlsOutbound {
         };
 
         codec::write_client_hello_with_padding(&mut stream, password, padding0_len).await?;
-        codec::write_frame(
-            &mut stream,
+        let settings_frame = codec::encode_frame(
             codec::CMD_SETTINGS,
             0,
             &codec::client_settings_with_padding_md5(&padding_md5),
-        )
-        .await?;
+        )?;
 
         let (tls_reader, tls_writer) = tokio::io::split(stream);
-        let session = Arc::new(ClientSession::new(tls_writer));
+        let session = Arc::new(ClientSession::new(
+            tls_writer,
+            settings_frame,
+            self.state.clone(),
+        ));
         tokio::spawn(session.clone().run_reader(tls_reader, self.state.clone()));
         Ok(session)
     }
@@ -199,17 +201,19 @@ type TlsReadHalf = ReadHalf<SslStream<TcpStream>>;
 type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 
 struct ClientSession {
-    writer: Arc<Mutex<TlsWriteHalf>>,
+    writer: Arc<Mutex<ClientWriter<TlsWriteHalf>>>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    state: Arc<Mutex<ClientState>>,
     next_stream_id: AtomicU32,
     closed: AtomicBool,
 }
 
 impl ClientSession {
-    fn new(writer: TlsWriteHalf) -> Self {
+    fn new(writer: TlsWriteHalf, initial_buffer: Vec<u8>, state: Arc<Mutex<ClientState>>) -> Self {
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(ClientWriter::new(writer, initial_buffer))),
             streams: Arc::new(Mutex::new(HashMap::new())),
+            state,
             next_stream_id: AtomicU32::new(1),
             closed: AtomicBool::new(false),
         }
@@ -234,21 +238,24 @@ impl ClientSession {
         stream_id: u32,
         target: &crate::session::TargetAddr,
     ) -> anyhow::Result<()> {
-        let mut writer = self.writer.lock().await;
-        codec::write_frame(&mut *writer, codec::CMD_SYN, stream_id, &[]).await?;
-        codec::write_frame(
-            &mut *writer,
-            codec::CMD_PSH,
-            stream_id,
-            &codec::encode_socksaddr(target)?,
-        )
-        .await?;
+        self.buffer_frame(codec::CMD_SYN, stream_id, &[]).await?;
+        self.write_frame(codec::CMD_PSH, stream_id, &codec::encode_socksaddr(target)?)
+            .await?;
         Ok(())
     }
 
-    async fn write_frame(&self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
+    async fn buffer_frame(&self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().await;
-        codec::write_frame(&mut *writer, command, stream_id, data).await
+        writer.buffer_frame(command, stream_id, data)
+    }
+
+    async fn write_frame(&self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
+        let plan = {
+            let state = self.state.lock().await;
+            codec::parse_padding_plan(&state.padding_scheme)?
+        };
+        let mut writer = self.writer.lock().await;
+        writer.write_frame(command, stream_id, data, &plan).await
     }
 
     async fn run_reader(
@@ -304,6 +311,70 @@ impl ClientSession {
 
         self.close();
         self.streams.lock().await.clear();
+    }
+}
+
+struct ClientWriter<W> {
+    inner: W,
+    buffer: Vec<u8>,
+    packet_counter: u32,
+    send_padding: bool,
+}
+
+impl<W> ClientWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn new(inner: W, initial_buffer: Vec<u8>) -> Self {
+        Self {
+            inner,
+            buffer: initial_buffer,
+            packet_counter: 0,
+            send_padding: true,
+        }
+    }
+
+    fn buffer_frame(&mut self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
+        self.buffer
+            .extend_from_slice(&codec::encode_frame(command, stream_id, data)?);
+        Ok(())
+    }
+
+    async fn write_frame(
+        &mut self,
+        command: u8,
+        stream_id: u32,
+        data: &[u8],
+        padding: &codec::PaddingPlan,
+    ) -> anyhow::Result<()> {
+        let frame = codec::encode_frame(command, stream_id, data)?;
+        self.write_conn(frame, padding).await
+    }
+
+    async fn write_conn(
+        &mut self,
+        mut data: Vec<u8>,
+        padding: &codec::PaddingPlan,
+    ) -> anyhow::Result<()> {
+        if !self.buffer.is_empty() {
+            let mut buffered = std::mem::take(&mut self.buffer);
+            buffered.extend_from_slice(&data);
+            data = buffered;
+        }
+
+        if self.send_padding {
+            self.packet_counter = self.packet_counter.wrapping_add(1);
+            if self.packet_counter < padding.stop {
+                for record in codec::shape_packet_payload(data, self.packet_counter, padding)? {
+                    self.inner.write_all(&record).await?;
+                }
+                return Ok(());
+            }
+            self.send_padding = false;
+        }
+
+        self.inner.write_all(&data).await?;
+        Ok(())
     }
 }
 
@@ -384,4 +455,46 @@ fn spawn_uot_stream(
             tracing::debug!(%err, target = %target, "anytls udp stream failed");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn frame_header(data: &[u8], offset: usize) -> (u8, u32, u16) {
+        (
+            data[offset],
+            u32::from_be_bytes(data[offset + 1..offset + 5].try_into().unwrap()),
+            u16::from_be_bytes(data[offset + 5..offset + 7].try_into().unwrap()),
+        )
+    }
+
+    #[tokio::test]
+    async fn client_writer_shapes_initial_settings_syn_and_psh_as_one_packet() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let initial_buffer = codec::encode_frame(codec::CMD_SETTINGS, 0, b"v=2").unwrap();
+        let plan = codec::parse_padding_plan(&["stop=3".to_owned(), "1=64-64".to_owned()]).unwrap();
+        let mut writer = ClientWriter::new(client, initial_buffer);
+
+        writer.buffer_frame(codec::CMD_SYN, 1, &[]).unwrap();
+        writer
+            .write_frame(codec::CMD_PSH, 1, b"target", &plan)
+            .await
+            .unwrap();
+
+        let mut packet = vec![0; 64];
+        server.read_exact(&mut packet).await.unwrap();
+
+        assert_eq!(
+            frame_header(&packet, 0),
+            (codec::CMD_SETTINGS, 0, b"v=2".len() as u16)
+        );
+        assert_eq!(frame_header(&packet, 10), (codec::CMD_SYN, 1, 0));
+        assert_eq!(
+            frame_header(&packet, 17),
+            (codec::CMD_PSH, 1, b"target".len() as u16)
+        );
+        assert_eq!(frame_header(&packet, 30), (codec::CMD_WASTE, 0, 27));
+    }
 }

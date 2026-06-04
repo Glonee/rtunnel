@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
+use boring::rand::rand_bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -20,6 +21,7 @@ pub const CMD_HEART_REQUEST: u8 = 8;
 pub const CMD_HEART_RESPONSE: u8 = 9;
 pub const CMD_SERVER_SETTINGS: u8 = 10;
 pub const UOT_V2_MAGIC_HOST: &str = "sp.v2.udp-over-tcp.arpa";
+pub const FRAME_HEADER_LEN: usize = 1 + 4 + 2;
 const PASSWORD_HASH_LEN: usize = 32;
 pub const DEFAULT_PADDING_MD5: &str = "e872e281aa5e28149c0f6b8d36e79199";
 pub const DEFAULT_PADDING_SCHEME: &str = "\
@@ -38,6 +40,24 @@ pub struct PaddingRule {
     pub stage: u8,
     pub min: u16,
     pub max: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaddingStep {
+    Size { min: u16, max: u16 },
+    Check,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratedPaddingStep {
+    Size(usize),
+    Check,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaddingPlan {
+    pub stop: u32,
+    entries: Vec<(u32, Vec<PaddingStep>)>,
 }
 
 pub fn parse_padding_scheme(lines: &[String]) -> anyhow::Result<Vec<PaddingRule>> {
@@ -65,6 +85,87 @@ pub fn parse_padding_scheme(lines: &[String]) -> anyhow::Result<Vec<PaddingRule>
         }
     }
     Ok(rules)
+}
+
+pub fn parse_padding_plan(lines: &[String]) -> anyhow::Result<PaddingPlan> {
+    let text = padding_scheme_text(lines);
+    let mut stop = None;
+    let mut entries = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, spec)) = line.split_once('=') else {
+            continue;
+        };
+        if key == "stop" {
+            stop = Some(spec.parse()?);
+            continue;
+        }
+
+        let Ok(stage) = key.parse::<u32>() else {
+            continue;
+        };
+        let mut steps = Vec::new();
+        for part in spec
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            if part == "c" {
+                steps.push(PaddingStep::Check);
+                continue;
+            }
+            let Some((min, max)) = part.split_once('-') else {
+                continue;
+            };
+            let Ok(mut min) = min.parse::<u16>() else {
+                continue;
+            };
+            let Ok(mut max) = max.parse::<u16>() else {
+                continue;
+            };
+            if min == 0 || max == 0 {
+                continue;
+            }
+            if min > max {
+                std::mem::swap(&mut min, &mut max);
+            }
+            steps.push(PaddingStep::Size { min, max });
+        }
+        entries.push((stage, steps));
+    }
+
+    Ok(PaddingPlan {
+        stop: stop.ok_or_else(|| anyhow::anyhow!("padding scheme missing stop"))?,
+        entries,
+    })
+}
+
+impl PaddingPlan {
+    pub fn generate_record_payload_steps(
+        &self,
+        packet: u32,
+    ) -> anyhow::Result<Vec<GeneratedPaddingStep>> {
+        let Some((_, steps)) = self.entries.iter().find(|(stage, _)| *stage == packet) else {
+            return Ok(Vec::new());
+        };
+        steps
+            .iter()
+            .map(|step| match step {
+                PaddingStep::Check => Ok(GeneratedPaddingStep::Check),
+                PaddingStep::Size { min, max } => {
+                    Ok(GeneratedPaddingStep::Size(random_range(*min, *max)?))
+                }
+            })
+            .collect()
+    }
+
+    pub fn steps_for_packet(&self, packet: u32) -> Option<&[PaddingStep]> {
+        self.entries
+            .iter()
+            .find(|(stage, _)| *stage == packet)
+            .map(|(_, steps)| steps.as_slice())
+    }
 }
 
 #[derive(Debug)]
@@ -147,12 +248,71 @@ pub async fn write_frame<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    anyhow::ensure!(data.len() <= u16::MAX as usize, "anytls frame is too large");
-    stream.write_u8(command).await?;
-    stream.write_u32(stream_id).await?;
-    stream.write_u16(data.len() as u16).await?;
-    stream.write_all(data).await?;
+    stream
+        .write_all(&encode_frame(command, stream_id, data)?)
+        .await?;
     Ok(())
+}
+
+pub fn encode_frame(command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(data.len() <= u16::MAX as usize, "anytls frame is too large");
+    let mut output = Vec::with_capacity(FRAME_HEADER_LEN + data.len());
+    output.push(command);
+    output.extend_from_slice(&stream_id.to_be_bytes());
+    output.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    output.extend_from_slice(data);
+    Ok(output)
+}
+
+pub fn encode_waste_frame(data_len: usize) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        data_len <= u16::MAX as usize,
+        "anytls waste frame is too large"
+    );
+    let data = vec![0; data_len];
+    encode_frame(CMD_WASTE, 0, &data)
+}
+
+pub fn shape_packet_payload(
+    mut payload: Vec<u8>,
+    packet: u32,
+    plan: &PaddingPlan,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let steps = plan.generate_record_payload_steps(packet)?;
+    if steps.is_empty() {
+        return Ok(vec![payload]);
+    }
+
+    let mut records = Vec::new();
+    for step in steps {
+        let remaining = payload.len();
+        match step {
+            GeneratedPaddingStep::Check => {
+                if remaining == 0 {
+                    break;
+                }
+            }
+            GeneratedPaddingStep::Size(size) if remaining > size => {
+                records.push(payload.drain(..size).collect());
+            }
+            GeneratedPaddingStep::Size(size) if remaining > 0 => {
+                let mut record = std::mem::take(&mut payload);
+                let padding_len = size.saturating_sub(remaining + FRAME_HEADER_LEN);
+                if padding_len > 0 {
+                    record.extend_from_slice(&encode_waste_frame(padding_len)?);
+                }
+                records.push(record);
+            }
+            GeneratedPaddingStep::Size(size) => {
+                records.push(encode_waste_frame(size)?);
+            }
+        }
+    }
+
+    if !payload.is_empty() {
+        records.push(payload);
+    }
+    Ok(records)
 }
 
 pub async fn write_uot_v2_request<S>(
@@ -300,12 +460,15 @@ pub fn padding_scheme_md5(lines: &[String]) -> String {
 }
 
 pub fn padding0_len(lines: &[String]) -> anyhow::Result<u16> {
-    let rules = parse_padding_scheme(lines)?;
-    Ok(rules
-        .iter()
-        .find(|rule| rule.stage == 0)
-        .map(|rule| rule.min)
-        .unwrap_or(30))
+    let plan = parse_padding_plan(lines)?;
+    let Some(GeneratedPaddingStep::Size(size)) = plan
+        .generate_record_payload_steps(0)?
+        .into_iter()
+        .find(|step| matches!(step, GeneratedPaddingStep::Size(_)))
+    else {
+        return Ok(30);
+    };
+    Ok(size as u16)
 }
 
 pub fn encode_socksaddr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
@@ -388,6 +551,24 @@ fn read_u16(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<u16> {
     Ok(u16::from_be_bytes(buf))
 }
 
+fn random_range(min: u16, max: u16) -> anyhow::Result<usize> {
+    if min == max {
+        return Ok(min as usize);
+    }
+    let span = u128::from(max - min);
+    let sample_space = 1u128 << 64;
+    let limit = sample_space - (sample_space % span);
+
+    loop {
+        let mut bytes = [0; 8];
+        rand_bytes(&mut bytes)?;
+        let value = u128::from(u64::from_be_bytes(bytes));
+        if value < limit {
+            return Ok((u128::from(min) + value % span) as usize);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +602,66 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn parses_padding_plan_with_checkpoints() {
+        let plan =
+            parse_padding_plan(&["stop=8".to_owned(), "2=400-500,c,500-1000".to_owned()]).unwrap();
+
+        assert_eq!(plan.stop, 8);
+        assert_eq!(
+            plan.steps_for_packet(2).unwrap(),
+            [
+                PaddingStep::Size { min: 400, max: 500 },
+                PaddingStep::Check,
+                PaddingStep::Size {
+                    min: 500,
+                    max: 1000
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn shapes_packet_payload_with_waste_padding() {
+        let plan = parse_padding_plan(&["stop=3".to_owned(), "1=20-20".to_owned()]).unwrap();
+        let payload = vec![0xaa; 12];
+
+        let records = shape_packet_payload(payload.clone(), 1, &plan).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].len(), 20);
+        assert_eq!(&records[0][..payload.len()], payload.as_slice());
+        assert_eq!(records[0][12], CMD_WASTE);
+        assert_eq!(&records[0][13..17], [0, 0, 0, 0]);
+        assert_eq!(&records[0][17..19], [0, 1]);
+        assert_eq!(records[0][19], 0);
+    }
+
+    #[test]
+    fn shapes_packet_payload_with_splitting_and_checkpoints() {
+        let plan = parse_padding_plan(&["stop=3".to_owned(), "1=5-5,c,5-5".to_owned()]).unwrap();
+        let payload = vec![0xbb; 13];
+
+        let records = shape_packet_payload(payload, 1, &plan).unwrap();
+
+        assert_eq!(
+            records.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![5, 5, 3]
+        );
+    }
+
+    #[test]
+    fn shape_packet_payload_stops_at_checkpoint_when_payload_drained() {
+        let plan =
+            parse_padding_plan(&["stop=3".to_owned(), "1=20-20,c,20-20".to_owned()]).unwrap();
+        let payload = vec![0xcc; 12];
+
+        let records = shape_packet_payload(payload, 1, &plan).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].len(), 20);
     }
 
     #[test]
