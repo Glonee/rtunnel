@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::{Mutex, mpsc},
+    time::{Duration, Instant},
 };
 use tokio_boring::{SslStream, SslStreamBuilder};
 
@@ -22,6 +23,9 @@ use crate::{
     session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
     tls,
 };
+
+const UDP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UDP_STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct AnytlsOutbound {
     cfg: OutboundConfig,
@@ -188,9 +192,11 @@ impl Outbound for AnytlsOutbound {
             "anytls udp outbound only supports UDP associate"
         );
         let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        spawn_udp_stream_cleaner(streams.clone());
         Ok(Arc::new(AnytlsUdpSession {
             client: self.clone_client(),
-            streams: Mutex::new(HashMap::new()),
+            streams,
             response_tx,
             response_rx: Mutex::new(response_rx),
         }))
@@ -380,32 +386,74 @@ where
 
 struct AnytlsUdpSession {
     client: AnytlsOutbound,
-    streams: Mutex<HashMap<TargetAddr, mpsc::UnboundedSender<Vec<u8>>>>,
+    streams: Arc<Mutex<HashMap<TargetAddr, AnytlsUdpStream>>>,
     response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
     response_rx: Mutex<mpsc::UnboundedReceiver<(TargetAddr, Vec<u8>)>>,
+}
+
+struct AnytlsUdpStream {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    last_used: Arc<StdMutex<Instant>>,
+}
+
+impl AnytlsUdpSession {
+    async fn sender_for(
+        &self,
+        target: &TargetAddr,
+    ) -> anyhow::Result<mpsc::UnboundedSender<Vec<u8>>> {
+        let now = Instant::now();
+        let mut streams = self.streams.lock().await;
+        evict_idle_udp_streams(&mut streams, now);
+        if let Some(stream) = streams.get(target) {
+            touch_udp_activity(&stream.last_used, now);
+            return Ok(stream.tx.clone());
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let last_used = Arc::new(StdMutex::new(now));
+        streams.insert(
+            target.clone(),
+            AnytlsUdpStream {
+                tx: tx.clone(),
+                last_used: last_used.clone(),
+            },
+        );
+        spawn_uot_stream(
+            self.client.clone_client(),
+            target.clone(),
+            rx,
+            self.response_tx.clone(),
+            last_used,
+        );
+        Ok(tx)
+    }
+
+    async fn remove_stream(&self, target: &TargetAddr) {
+        self.streams.lock().await.remove(target);
+    }
 }
 
 #[async_trait]
 impl ProxyDatagram for AnytlsUdpSession {
     async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()> {
-        let tx = {
-            let mut streams = self.streams.lock().await;
-            if let Some(tx) = streams.get(target) {
-                tx.clone()
-            } else {
-                let (tx, rx) = mpsc::unbounded_channel();
-                streams.insert(target.clone(), tx.clone());
-                spawn_uot_stream(
-                    self.client.clone_client(),
-                    target.clone(),
-                    rx,
-                    self.response_tx.clone(),
-                );
-                tx
+        let mut data = payload.to_vec();
+        for retry in 0..2 {
+            let tx = self.sender_for(target).await?;
+            match tx.send(data) {
+                Ok(()) => return Ok(()),
+                Err(err) if retry == 0 => {
+                    data = err.0;
+                    self.remove_stream(target).await;
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "anytls udp stream for {target} is closed after retry: {} bytes unsent",
+                        err.0.len()
+                    ));
+                }
             }
-        };
-        tx.send(payload.to_vec())?;
-        Ok(())
+        }
+        unreachable!("retry loop always returns")
     }
 
     async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)> {
@@ -421,6 +469,7 @@ fn spawn_uot_stream(
     target: TargetAddr,
     mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    last_used: Arc<StdMutex<Instant>>,
 ) {
     tokio::spawn(async move {
         let result: anyhow::Result<()> = async {
@@ -439,10 +488,12 @@ fn spawn_uot_stream(
                         let Some(payload) = payload else {
                             break;
                         };
+                        touch_udp_activity(&last_used, Instant::now());
                         codec::write_uot_payload(&mut writer, &payload).await?;
                     }
                     payload = codec::read_uot_payload(&mut reader) => {
                         let payload = payload?;
+                        touch_udp_activity(&last_used, Instant::now());
                         let _ = response_tx.send((target.clone(), payload));
                     }
                 }
@@ -455,6 +506,54 @@ fn spawn_uot_stream(
             tracing::debug!(%err, target = %target, "anytls udp stream failed");
         }
     });
+}
+
+fn spawn_udp_stream_cleaner(streams: Arc<Mutex<HashMap<TargetAddr, AnytlsUdpStream>>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(UDP_STREAM_CLEANUP_INTERVAL);
+        loop {
+            interval.tick().await;
+            if Arc::strong_count(&streams) == 1 {
+                break;
+            }
+            let evicted = {
+                let mut streams = streams.lock().await;
+                evict_idle_udp_streams(&mut streams, Instant::now())
+            };
+            if evicted > 0 {
+                tracing::debug!(evicted, "anytls evicted idle udp streams");
+            }
+        }
+    });
+}
+
+fn evict_idle_udp_streams(
+    streams: &mut HashMap<TargetAddr, AnytlsUdpStream>,
+    now: Instant,
+) -> usize {
+    let before = streams.len();
+    streams.retain(|target, stream| {
+        let last_used = udp_last_used(&stream.last_used, now);
+        let keep = now.saturating_duration_since(last_used) < UDP_STREAM_IDLE_TIMEOUT;
+        if !keep {
+            tracing::debug!(%target, "anytls udp stream idle timeout");
+        }
+        keep
+    });
+    before - streams.len()
+}
+
+fn touch_udp_activity(last_used: &StdMutex<Instant>, now: Instant) {
+    if let Ok(mut last_used) = last_used.lock() {
+        *last_used = now;
+    }
+}
+
+fn udp_last_used(last_used: &StdMutex<Instant>, fallback: Instant) -> Instant {
+    last_used
+        .lock()
+        .map(|last_used| *last_used)
+        .unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -496,5 +595,41 @@ mod tests {
             (codec::CMD_PSH, 1, b"target".len() as u16)
         );
         assert_eq!(frame_header(&packet, 30), (codec::CMD_WASTE, 0, 27));
+    }
+
+    #[test]
+    fn evicts_idle_udp_streams() {
+        let now = Instant::now();
+        let old = now - UDP_STREAM_IDLE_TIMEOUT - Duration::from_secs(1);
+        let (stale_tx, _stale_rx) = mpsc::unbounded_channel();
+        let (fresh_tx, _fresh_rx) = mpsc::unbounded_channel();
+        let stale = TargetAddr::Domain {
+            host: "old.example".to_owned(),
+            port: 443,
+        };
+        let fresh = TargetAddr::Domain {
+            host: "fresh.example".to_owned(),
+            port: 443,
+        };
+        let mut streams = HashMap::from([
+            (
+                stale.clone(),
+                AnytlsUdpStream {
+                    tx: stale_tx,
+                    last_used: Arc::new(StdMutex::new(old)),
+                },
+            ),
+            (
+                fresh.clone(),
+                AnytlsUdpStream {
+                    tx: fresh_tx,
+                    last_used: Arc::new(StdMutex::new(now)),
+                },
+            ),
+        ]);
+
+        assert_eq!(evict_idle_udp_streams(&mut streams, now), 1);
+        assert!(!streams.contains_key(&stale));
+        assert!(streams.contains_key(&fresh));
     }
 }

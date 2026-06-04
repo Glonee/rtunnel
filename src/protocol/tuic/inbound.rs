@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -26,6 +27,9 @@ use crate::{
     router::Router,
     session::{Command, Session, TargetAddr},
 };
+
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(cfg.listen).await?;
@@ -114,6 +118,7 @@ struct TuicApp {
     streams: HashMap<u64, StreamState>,
     udp_sessions: HashMap<u16, UdpSession>,
     packet_assembler: codec::PacketAssembler,
+    next_udp_cleanup: Instant,
     next_uni_stream_id: u64,
     outbound_tx: mpsc::UnboundedSender<QuicWrite>,
     outbound_rx: mpsc::UnboundedReceiver<QuicWrite>,
@@ -134,6 +139,7 @@ struct PendingStream {
 struct UdpSession {
     tx: mpsc::UnboundedSender<UdpRequest>,
     mode: UdpMode,
+    last_used: Instant,
 }
 
 struct UdpRequest {
@@ -153,8 +159,12 @@ enum QuicWrite {
         data: Vec<u8>,
         fin: bool,
     },
-    Datagram(Vec<u8>),
+    Datagram {
+        assoc_id: Option<u16>,
+        data: Vec<u8>,
+    },
     UniStream {
+        assoc_id: Option<u16>,
         stream_id: Option<u64>,
         data: Vec<u8>,
     },
@@ -179,6 +189,7 @@ impl TuicApp {
             streams: HashMap::new(),
             udp_sessions: HashMap::new(),
             packet_assembler: codec::PacketAssembler::default(),
+            next_udp_cleanup: Instant::now() + UDP_SESSION_CLEANUP_INTERVAL,
             next_uni_stream_id: 3,
             outbound_tx,
             outbound_rx,
@@ -331,6 +342,7 @@ impl TuicApp {
             let Some(target) = packet.target.clone() else {
                 return Err(anyhow::anyhow!("tuic packet is missing target").into());
             };
+            let now = Instant::now();
             debug!(
                 assoc_id = packet.assoc_id,
                 mode = ?mode,
@@ -339,17 +351,49 @@ impl TuicApp {
                 "tuic udp packet received"
             );
             let session = self.udp_sessions.entry(packet.assoc_id).or_insert_with(|| {
-                spawn_udp_session(packet.assoc_id, mode, self.outbound_tx.clone())
+                spawn_udp_session(packet.assoc_id, mode, self.outbound_tx.clone(), now)
             });
             if session.mode != mode {
                 return Err(anyhow::anyhow!("tuic udp relay mode changed").into());
             }
+            session.last_used = now;
             let _ = session.tx.send(UdpRequest {
                 target,
                 payload: packet.payload,
             });
         }
         Ok(())
+    }
+
+    fn maybe_cleanup_udp_state(&mut self) {
+        let now = Instant::now();
+        if now < self.next_udp_cleanup {
+            return;
+        }
+        self.evict_idle_udp_sessions(now);
+        let evicted_fragments = self
+            .packet_assembler
+            .evict_idle(now, codec::FRAGMENT_IDLE_TIMEOUT);
+        if evicted_fragments > 0 {
+            debug!(evicted_fragments, "tuic evicted idle packet fragments");
+        }
+        self.next_udp_cleanup = now + UDP_SESSION_CLEANUP_INTERVAL;
+    }
+
+    fn evict_idle_udp_sessions(&mut self, now: Instant) {
+        self.udp_sessions.retain(|assoc_id, session| {
+            let keep = now.saturating_duration_since(session.last_used) < UDP_SESSION_IDLE_TIMEOUT;
+            if !keep {
+                debug!(assoc_id, "tuic udp association idle timeout");
+            }
+            keep
+        });
+    }
+
+    fn touch_udp_session(&mut self, assoc_id: u16) {
+        if let Some(session) = self.udp_sessions.get_mut(&assoc_id) {
+            session.last_used = Instant::now();
+        }
     }
 }
 
@@ -371,6 +415,7 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.maybe_cleanup_udp_state();
         if self.pending_writes.is_empty() {
             tokio::select! {
                 write = self.outbound_rx.recv() => {
@@ -385,6 +430,7 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.maybe_cleanup_udp_state();
         while let Some(stream_id) = qconn.stream_readable_next() {
             loop {
                 let mut buf = [0; 16 * 1024];
@@ -418,6 +464,7 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.maybe_cleanup_udp_state();
         while let Ok(write) = self.outbound_rx.try_recv() {
             self.pending_writes.push_back(write);
         }
@@ -448,18 +495,28 @@ impl ApplicationOverQuic for TuicApp {
                     }
                     Err(err) => return Err(Box::new(err)),
                 },
-                QuicWrite::Datagram(data) => match qconn.dgram_send(&data) {
-                    Ok(_) => {}
-                    Err(quiche::Error::Done) => {
-                        self.pending_writes.push_front(QuicWrite::Datagram(data));
-                        break;
+                QuicWrite::Datagram { assoc_id, data } => {
+                    if let Some(assoc_id) = assoc_id {
+                        self.touch_udp_session(assoc_id);
                     }
-                    Err(err) => return Err(Box::new(err)),
-                },
+                    match qconn.dgram_send(&data) {
+                        Ok(_) => {}
+                        Err(quiche::Error::Done) => {
+                            self.pending_writes
+                                .push_front(QuicWrite::Datagram { assoc_id, data });
+                            break;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
                 QuicWrite::UniStream {
+                    assoc_id,
                     mut stream_id,
                     data,
                 } => {
+                    if let Some(assoc_id) = assoc_id {
+                        self.touch_udp_session(assoc_id);
+                    }
                     let id = *stream_id.get_or_insert_with(|| {
                         let id = self.next_uni_stream_id;
                         self.next_uni_stream_id += 4;
@@ -469,6 +526,7 @@ impl ApplicationOverQuic for TuicApp {
                         Ok(sent) if sent == data.len() => {}
                         Ok(sent) => {
                             self.pending_writes.push_front(QuicWrite::UniStream {
+                                assoc_id,
                                 stream_id: Some(id),
                                 data: data[sent..].to_vec(),
                             });
@@ -476,6 +534,7 @@ impl ApplicationOverQuic for TuicApp {
                         }
                         Err(quiche::Error::Done) => {
                             self.pending_writes.push_front(QuicWrite::UniStream {
+                                assoc_id,
                                 stream_id: Some(id),
                                 data,
                             });
@@ -552,6 +611,7 @@ fn spawn_udp_session(
     assoc_id: u16,
     mode: UdpMode,
     quic_tx: mpsc::UnboundedSender<QuicWrite>,
+    now: Instant,
 ) -> UdpSession {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -559,7 +619,11 @@ fn spawn_udp_session(
             debug!(%err, %assoc_id, "tuic udp relay failed");
         }
     });
-    UdpSession { tx, mode }
+    UdpSession {
+        tx,
+        mode,
+        last_used: now,
+    }
 }
 
 async fn run_udp_session(
@@ -603,8 +667,12 @@ async fn run_udp_session(
                 );
                 let encoded = codec::encode_packet(&packet)?;
                 let write = match mode {
-                    UdpMode::Native => QuicWrite::Datagram(encoded),
+                    UdpMode::Native => QuicWrite::Datagram {
+                        assoc_id: Some(assoc_id),
+                        data: encoded,
+                    },
                     UdpMode::Quic => QuicWrite::UniStream {
+                        assoc_id: Some(assoc_id),
                         stream_id: None,
                         data: encoded,
                     },

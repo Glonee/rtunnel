@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     io::Cursor,
     os::raw::{c_char, c_int, c_uchar},
+    time::{Duration, Instant},
 };
 use tuic_core::{
     Address, Authenticate, Connect, Dissociate, Header, Heartbeat, Packet as CorePacket,
@@ -20,6 +21,7 @@ pub const CMD_DISSOCIATE: u8 = Header::TYPE_CODE_DISSOCIATE;
 pub const CMD_HEARTBEAT: u8 = Header::TYPE_CODE_HEARTBEAT;
 pub const TOKEN_LEN: usize = 32;
 pub const AUTHENTICATE_LEN: usize = 2 + 16 + TOKEN_LEN;
+pub const FRAGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 unsafe extern "C" {
     fn SSL_export_keying_material(
@@ -211,6 +213,12 @@ pub struct PacketAssembler {
 
 impl PacketAssembler {
     pub fn push(&mut self, packet: Packet) -> anyhow::Result<Option<Packet>> {
+        let now = Instant::now();
+        self.evict_idle(now, FRAGMENT_IDLE_TIMEOUT);
+        self.push_at(packet, now)
+    }
+
+    pub fn push_at(&mut self, packet: Packet, now: Instant) -> anyhow::Result<Option<Packet>> {
         if packet.frag_total == 1 {
             anyhow::ensure!(
                 packet.target.is_some(),
@@ -228,12 +236,14 @@ impl PacketAssembler {
                 pkt_id: packet.pkt_id,
                 frag_total: packet.frag_total,
                 target: None,
+                last_used: now,
                 fragments: BTreeMap::new(),
             });
         anyhow::ensure!(
             entry.frag_total == packet.frag_total,
             "fragment total changed within packet"
         );
+        entry.last_used = now;
         if packet.frag_id == 0 {
             entry.target = packet.target.clone();
         }
@@ -263,6 +273,17 @@ impl PacketAssembler {
         self.fragments.remove(&key);
         Ok(Some(complete))
     }
+
+    pub fn evict_idle(&mut self, now: Instant, timeout: Duration) -> usize {
+        let before = self.fragments.len();
+        self.fragments
+            .retain(|_, packet| now.saturating_duration_since(packet.last_used) < timeout);
+        before - self.fragments.len()
+    }
+
+    pub fn pending_fragment_groups(&self) -> usize {
+        self.fragments.len()
+    }
 }
 
 struct FragmentedPacket {
@@ -270,6 +291,7 @@ struct FragmentedPacket {
     pkt_id: u16,
     frag_total: u8,
     target: Option<TargetAddr>,
+    last_used: Instant,
     fragments: BTreeMap<u8, Vec<u8>>,
 }
 
@@ -388,5 +410,32 @@ mod tests {
 
         assert_eq!(packet.target, Some(target));
         assert_eq!(packet.payload, b"hello");
+    }
+
+    #[test]
+    fn evicts_idle_packet_fragments() {
+        let mut assembler = PacketAssembler::default();
+        let now = Instant::now();
+        let old = now - Duration::from_secs(60);
+
+        assert!(
+            assembler
+                .push_at(
+                    Packet {
+                        assoc_id: 1,
+                        pkt_id: 2,
+                        frag_total: 2,
+                        frag_id: 1,
+                        target: None,
+                        payload: b"stale".to_vec(),
+                    },
+                    old,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(assembler.pending_fragment_groups(), 1);
+        assert_eq!(assembler.evict_idle(now, FRAGMENT_IDLE_TIMEOUT), 1);
+        assert_eq!(assembler.pending_fragment_groups(), 0);
     }
 }

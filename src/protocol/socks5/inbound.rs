@@ -1,13 +1,13 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Mutex,
 };
 use tracing::{debug, info};
 
@@ -17,6 +17,8 @@ use crate::{
     router::Router,
     session::{BoxDatagram, Command, Session, TargetAddr},
 };
+
+const UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -201,27 +203,8 @@ async fn handle_udp_associate(
     write_reply(&mut control, 0, reply.clone()).await?;
     debug!(%peer, bind = %reply, "socks5 udp associated");
 
-    let client_addr = Arc::new(Mutex::new(None));
-    let recv_socket = socket.clone();
-    let recv_client_addr = client_addr.clone();
-    let recv_outbound = outbound.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((source, payload)) = recv_outbound.recv_from().await else {
-                break;
-            };
-            let Some(client) = *recv_client_addr.lock().await else {
-                continue;
-            };
-            let Ok(packet) = codec::encode_udp_packet(&source, &payload) else {
-                continue;
-            };
-            if recv_socket.send_to(&packet, client).await.is_err() {
-                break;
-            }
-        }
-    });
-
+    let mut client_addr = None;
+    let mut last_activity = Instant::now();
     let mut control_buf = [0; 1];
     let mut udp_buf = vec![0; 64 * 1024];
     loop {
@@ -232,24 +215,37 @@ async fn handle_udp_associate(
                     Ok(_) => {}
                 }
             }
+            received = outbound.recv_from() => {
+                let (source, payload) = received?;
+                let Some(client) = client_addr else {
+                    continue;
+                };
+                let Ok(packet) = codec::encode_udp_packet(&source, &payload) else {
+                    continue;
+                };
+                socket.send_to(&packet, client).await?;
+                last_activity = Instant::now();
+            }
             received = socket.recv_from(&mut udp_buf) => {
                 let (read, client) = received?;
-                {
-                    let mut known = client_addr.lock().await;
-                    if known.is_none() {
-                        *known = Some(client);
-                    }
-                    if *known != Some(client) {
-                        continue;
-                    }
+                if client_addr.is_none() {
+                    client_addr = Some(client);
+                }
+                if client_addr != Some(client) {
+                    continue;
                 }
                 match codec::decode_udp_packet(&udp_buf[..read]) {
                     Ok((target, payload)) => {
                         debug!(target = %target, inbound = %session.inbound, "socks5 udp packet");
                         outbound.send_to(&target, &payload).await?;
+                        last_activity = Instant::now();
                     }
                     Err(err) => debug!(%err, "invalid socks5 udp packet"),
                 }
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_activity + UDP_ASSOCIATE_IDLE_TIMEOUT)) => {
+                debug!(%peer, "socks5 udp associate idle timeout");
+                break;
             }
         }
     }
