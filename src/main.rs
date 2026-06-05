@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
-use rtunnel::{config::Config, protocol, router::Router};
+use rtunnel::{acme::AcmeManager, config::Config, protocol, router::Router};
 use tokio::signal;
 use tracing::info;
 
@@ -19,12 +19,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let cfg = Config::load(&args.config)
+    let mut cfg = Config::load(&args.config)
         .with_context(|| format!("failed to load config {}", args.config.display()))?;
 
     tracing_subscriber::fmt()
         .with_env_filter(cfg.log_level.as_deref().unwrap_or("info"))
         .init();
+
+    let acme = AcmeManager::prepare(&mut cfg).await?;
+    if let Some(acme) = acme {
+        acme.spawn_renewal_tasks();
+    }
 
     let router = Arc::new(Router::new(cfg.clone())?);
     for inbound_cfg in cfg.inbounds.clone() {

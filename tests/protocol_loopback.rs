@@ -343,6 +343,7 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
     };
     let router = Arc::new(Router::new(Config {
         log_level: None,
+        acme: None,
         inbounds: vec![inbound_cfg.clone()],
         outbounds: vec![OutboundConfig {
             tag: "direct".to_owned(),
@@ -387,6 +388,7 @@ async fn spawn_anytls_inbound_with_padding(
     };
     let router = Arc::new(Router::new(Config {
         log_level: None,
+        acme: None,
         inbounds: vec![inbound_cfg.clone()],
         outbounds: vec![OutboundConfig {
             tag: "direct".to_owned(),
@@ -509,6 +511,7 @@ async fn spawn_tuic_inbound() -> anyhow::Result<SocketAddr> {
     };
     let router = Arc::new(Router::new(Config {
         log_level: None,
+        acme: None,
         inbounds: vec![inbound_cfg.clone()],
         outbounds: vec![OutboundConfig {
             tag: "direct".to_owned(),
@@ -791,8 +794,9 @@ fn write_test_tls_files() -> anyhow::Result<TlsServerConfig> {
     std::fs::write(&cert, CERT_PEM)?;
     std::fs::write(&key, KEY_PEM)?;
     Ok(TlsServerConfig {
-        certificate: cert.to_string_lossy().into_owned(),
-        private_key: key.to_string_lossy().into_owned(),
+        certificate: Some(cert.to_string_lossy().into_owned()),
+        private_key: Some(key.to_string_lossy().into_owned()),
+        acme: None,
     })
 }
 

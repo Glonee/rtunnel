@@ -10,6 +10,8 @@ Supported:
   CONNECT framing
 - TUIC v5 inbound and outbound over `tokio-quiche`, including TCP relay,
   authentication, heartbeat, and UDP packet relay modes
+- ACME HTTP-01 certificates for AnyTLS and TUIC inbounds, with cached PEM files
+  and hot reload for new TLS handshakes
 - A TOML config format with route rules and default outbound selection
 
 For the expected workflow when adding or completing a protocol, see
@@ -27,6 +29,29 @@ cargo run -- -c examples/socks.toml
 ```
 
 Then point a SOCKS5 client at `127.0.0.1:1080`.
+
+## ACME certificates
+
+AnyTLS and TUIC inbounds can use ACME instead of static certificate files:
+
+```toml
+[acme]
+directory = "letsencrypt-staging"
+http_listen = "0.0.0.0:80"
+accept_terms = true
+contact = ["mailto:admin@example.com"]
+
+[inbounds.tls.acme]
+domains = ["proxy.example.com"]
+```
+
+`directory` defaults to `letsencrypt-staging`; use `letsencrypt-production` for
+public trusted certificates after testing. HTTP-01 requires the configured
+`http_listen` address, normally port 80, to be reachable for every domain in
+`tls.acme.domains`. Certificates and account credentials are cached under
+`.rtunel/acme` by default. If no valid cached certificate exists and issuance
+fails, startup fails; if a cached certificate is still valid, renewal failures
+are logged and retried later.
 
 ## TLS fingerprinting
 
