@@ -16,7 +16,7 @@ use tokio_quiche::{
     metrics::DefaultMetrics,
     quic::{HandshakeInfo, QuicheConnection},
     quiche,
-    settings::{CertificateKind, ConnectionParams, Hooks, TlsCertificatePaths},
+    settings::{CertificateKind, ConnectionParams, TlsCertificatePaths},
 };
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -26,6 +26,7 @@ use crate::{
     protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
     router::Router,
     session::{Command, Session, TargetAddr},
+    tls,
 };
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -41,7 +42,7 @@ pub async fn serve(
     cfg: InboundConfig,
     router: Arc<Router>,
 ) -> anyhow::Result<()> {
-    let tls = cfg
+    let tls_cfg = cfg
         .tls
         .as_ref()
         .context("tuic inbound requires tls config")?;
@@ -52,11 +53,11 @@ pub async fn serve(
     let params = ConnectionParams::new_server(
         settings,
         TlsCertificatePaths {
-            cert: tls.certificate.as_str(),
-            private_key: tls.private_key.as_str(),
+            cert: tls_cfg.certificate_path()?,
+            private_key: tls_cfg.private_key_path()?,
             kind: CertificateKind::X509,
         },
-        Hooks::default(),
+        tls::quic_hooks(tls_cfg)?,
     );
 
     let mut listeners = tokio_quiche::listen([socket], params, DefaultMetrics)?;

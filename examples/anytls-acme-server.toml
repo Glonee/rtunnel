@@ -1,0 +1,29 @@
+log_level = "info"
+
+[acme]
+directory = "letsencrypt-staging"
+cache_dir = ".rtunel/acme"
+http_listen = "0.0.0.0:80"
+renew_before_days = 30
+accept_terms = true
+contact = ["mailto:admin@example.com"]
+
+[[inbounds]]
+tag = "anytls-in"
+listen = "0.0.0.0:443"
+protocol = "anytls"
+padding_scheme = ["stop=8", "0=30-30", "1=100-400"]
+
+[[inbounds.users]]
+username = "user"
+password = "secret"
+
+[inbounds.tls.acme]
+domains = ["proxy.example.com"]
+
+[[outbounds]]
+tag = "direct"
+protocol = "direct"
+
+[routing]
+default = "direct"
