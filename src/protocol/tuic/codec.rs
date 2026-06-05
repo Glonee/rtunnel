@@ -3,7 +3,6 @@ use foreign_types::ForeignTypeRef;
 use std::{
     collections::BTreeMap,
     io::Cursor,
-    os::raw::{c_char, c_int, c_uchar},
     time::{Duration, Instant},
 };
 use tuic_core::{
@@ -23,19 +22,6 @@ pub const TOKEN_LEN: usize = 32;
 pub const AUTHENTICATE_LEN: usize = 2 + 16 + TOKEN_LEN;
 pub const FRAGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-unsafe extern "C" {
-    fn SSL_export_keying_material(
-        ssl: *mut boring_sys::SSL,
-        out: *mut c_uchar,
-        olen: usize,
-        label: *const c_char,
-        llen: usize,
-        context: *const c_uchar,
-        contextlen: usize,
-        use_context: c_int,
-    ) -> c_int;
-}
-
 pub fn token(ssl: &SslRef, uuid: Uuid, password: &str) -> anyhow::Result<[u8; TOKEN_LEN]> {
     let mut token = [0; TOKEN_LEN];
     export_keying_material_raw_label(&mut token, ssl, uuid.as_bytes(), password.as_bytes())?;
@@ -49,7 +35,7 @@ fn export_keying_material_raw_label(
     context: &[u8],
 ) -> anyhow::Result<()> {
     let ok = unsafe {
-        SSL_export_keying_material(
+        boring_sys::SSL_export_keying_material(
             ssl.as_ptr(),
             out.as_mut_ptr(),
             out.len(),
