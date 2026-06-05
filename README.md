@@ -49,7 +49,7 @@ domains = ["proxy.example.com"]
 public trusted certificates after testing. HTTP-01 requires the configured
 `http_listen` address, normally port 80, to be reachable for every domain in
 `tls.acme.domains`. Certificates and account credentials are cached under
-`.rtunel/acme` by default. If no valid cached certificate exists and issuance
+`.rtunnel/acme` by default. If no valid cached certificate exists and issuance
 fails, startup fails; if a cached certificate is still valid, renewal failures
 are logged and retried later.
 
