@@ -2,6 +2,15 @@ name: sing-box interop
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - src/**
+      - scripts/interop-sing-box.mjs
+      - .github/workflows/sing-box-interop.yml
   pull_request:
     paths:
       - Cargo.lock
