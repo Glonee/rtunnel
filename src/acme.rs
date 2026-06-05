@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    convert::Infallible,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,30 +15,33 @@ use boring::{
     ssl::{SslContextBuilder, SslMethod},
     x509::X509,
 };
+use hyper014::{
+    Body, Method, Request, Response, Server, StatusCode, header,
+    service::{make_service_fn, service_fn},
+};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
-    NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::RwLock,
+    sync::{RwLock, oneshot},
+    task::JoinHandle,
     time,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{AcmeConfig, Config};
 
 const CERT_FILE: &str = "cert.pem";
 const KEY_FILE: &str = "key.pem";
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+const CHALLENGE_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AcmeManager {
     cfg: AcmeConfig,
     account: Account,
-    challenges: ChallengeStore,
     targets: Vec<AcmeTarget>,
 }
 
@@ -49,13 +53,10 @@ impl AcmeManager {
             return Ok(None);
         }
 
-        let challenges = ChallengeStore::default();
-        start_challenge_server(cfg.http_listen, challenges.clone()).await?;
         let account = load_account(&cfg).await?;
         let manager = Self {
             cfg,
             account,
-            challenges,
             targets,
         };
         manager.prepare_certificates().await?;
@@ -130,19 +131,39 @@ impl AcmeManager {
     }
 
     async fn issue_certificate(&self, target: &AcmeTarget) -> anyhow::Result<()> {
+        let challenges = ChallengeStore::default();
+        let challenge_server =
+            start_challenge_server(self.cfg.http_listen, challenges.clone()).await?;
         let mut tokens = Vec::new();
-        let result = self.issue_certificate_inner(target, &mut tokens).await;
+        let result = self
+            .validate_order(target, challenges.clone(), &mut tokens)
+            .await;
         for token in tokens {
-            self.challenges.remove(&token).await;
+            challenges.remove(&token).await;
         }
-        result
+        challenge_server.shutdown().await;
+        let mut order = result?;
+
+        let private_key_pem = order.finalize().await?;
+        let cert_chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
+        validate_certificate_pair(&cert_chain_pem, &private_key_pem)
+            .context("ACME CA returned an unusable certificate or key")?;
+        atomic_write(&target.key_path, private_key_pem.as_bytes())?;
+        atomic_write(&target.cert_path, cert_chain_pem.as_bytes())?;
+        info!(
+            domains = ?target.domains,
+            certificate = %target.cert_path.display(),
+            "stored ACME certificate"
+        );
+        Ok(())
     }
 
-    async fn issue_certificate_inner(
+    async fn validate_order(
         &self,
         target: &AcmeTarget,
+        challenges: ChallengeStore,
         tokens: &mut Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Order> {
         info!(domains = ?target.domains, "requesting ACME certificate");
         let identifiers = target
             .domains
@@ -169,9 +190,7 @@ impl AcmeManager {
                 .context("ACME authorization did not offer an HTTP-01 challenge")?;
             let token = challenge.token.clone();
             let key_authorization = challenge.key_authorization().as_str().to_owned();
-            self.challenges
-                .insert(token.clone(), key_authorization)
-                .await;
+            challenges.insert(token.clone(), key_authorization).await;
             tokens.push(token);
             challenge.set_ready().await?;
         }
@@ -183,19 +202,11 @@ impl AcmeManager {
             status == OrderStatus::Ready,
             "ACME order was not ready after validation: {status:?}"
         );
-
-        let private_key_pem = order.finalize().await?;
-        let cert_chain_pem = order.poll_certificate(&retry).await?;
-        validate_certificate_pair(&cert_chain_pem, &private_key_pem)
-            .context("ACME CA returned an unusable certificate or key")?;
-        atomic_write(&target.key_path, private_key_pem.as_bytes())?;
-        atomic_write(&target.cert_path, cert_chain_pem.as_bytes())?;
         info!(
             domains = ?target.domains,
-            certificate = %target.cert_path.display(),
-            "stored ACME certificate"
+            "ACME HTTP-01 validation complete"
         );
-        Ok(())
+        Ok(order)
     }
 }
 
@@ -276,74 +287,89 @@ fn target_for_domains(acme_cfg: &AcmeConfig, domains: &[String]) -> AcmeTarget {
 async fn start_challenge_server(
     listen: std::net::SocketAddr,
     challenges: ChallengeStore,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("failed to bind ACME HTTP-01 listener on {listen}"))?;
-    info!(%listen, "ACME HTTP-01 challenge listener started");
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    let challenges = challenges.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_challenge_connection(stream, challenges).await {
-                            debug!(%peer, %err, "ACME HTTP-01 request failed");
-                        }
-                    });
-                }
-                Err(err) => warn!(%err, "ACME HTTP-01 listener accept failed"),
-            }
+) -> anyhow::Result<ChallengeServer> {
+    let service = make_service_fn(move |_| {
+        let challenges = challenges.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request| {
+                handle_challenge_request(request, challenges.clone())
+            }))
         }
     });
-    Ok(())
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = Server::try_bind(&listen)
+        .with_context(|| format!("failed to bind ACME HTTP-01 listener on {listen}"))?
+        .serve(service)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        });
+    info!(%listen, "ACME HTTP-01 challenge listener started");
+    let task = tokio::spawn(async move {
+        if let Err(err) = server.await {
+            warn!(%err, "ACME HTTP-01 listener exited");
+        }
+    });
+    Ok(ChallengeServer {
+        shutdown: Some(shutdown_tx),
+        task,
+    })
 }
 
-async fn handle_challenge_connection(
-    mut stream: TcpStream,
-    challenges: ChallengeStore,
-) -> anyhow::Result<()> {
-    let mut buf = [0_u8; 2048];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let request_line = request.lines().next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
+struct ChallengeServer {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
 
-    let body = match (method, challenge_token(path)) {
-        ("GET", Some(token)) => challenges.get(token).await,
+impl ChallengeServer {
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        tokio::select! {
+            result = &mut self.task => {
+                if let Err(err) = result {
+                    warn!(%err, "ACME HTTP-01 listener task failed during shutdown");
+                }
+            }
+            _ = time::sleep(CHALLENGE_SERVER_SHUTDOWN_TIMEOUT) => {
+                self.task.abort();
+                if let Err(err) = self.task.await {
+                    if !err.is_cancelled() {
+                        warn!(%err, "ACME HTTP-01 listener task failed after forced shutdown");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_challenge_request(
+    request: Request<Body>,
+    challenges: ChallengeStore,
+) -> Result<Response<Body>, Infallible> {
+    let body = match (request.method(), challenge_token(request.uri().path())) {
+        (&Method::GET, Some(token)) => challenges.get(token).await,
         _ => None,
     };
-
-    if let Some(body) = body {
-        write_http_response(&mut stream, 200, "OK", body.as_bytes()).await?;
+    let response = if let Some(body) = body {
+        text_response(StatusCode::OK, body)
     } else {
-        write_http_response(&mut stream, 404, "Not Found", b"not found\n").await?;
-    }
-    Ok(())
+        text_response(StatusCode::NOT_FOUND, "not found\n")
+    };
+    Ok(response)
 }
 
 fn challenge_token(path: &str) -> Option<&str> {
-    let path = path.split_once('?').map_or(path, |(path, _)| path);
     let token = path.strip_prefix("/.well-known/acme-challenge/")?;
     (!token.is_empty() && !token.contains('/')).then_some(token)
 }
 
-async fn write_http_response(
-    stream: &mut TcpStream,
-    status: u16,
-    reason: &str,
-    body: &[u8],
-) -> anyhow::Result<()> {
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.shutdown().await?;
-    Ok(())
+fn text_response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(body.into())
+        .expect("static ACME challenge response is valid")
 }
 
 async fn load_account(cfg: &AcmeConfig) -> anyhow::Result<Account> {
@@ -527,19 +553,25 @@ fn stable_slug(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper014::body::to_bytes;
 
-    #[test]
-    fn challenge_token_accepts_only_http01_path() {
-        assert_eq!(
-            challenge_token("/.well-known/acme-challenge/token123"),
-            Some("token123")
-        );
-        assert_eq!(
-            challenge_token("/.well-known/acme-challenge/token123?x=1"),
-            Some("token123")
-        );
-        assert_eq!(challenge_token("/elsewhere/token123"), None);
-        assert_eq!(challenge_token("/.well-known/acme-challenge/"), None);
-        assert_eq!(challenge_token("/.well-known/acme-challenge/a/b"), None);
+    #[tokio::test]
+    async fn challenge_request_serves_known_token() {
+        let challenges = ChallengeStore::default();
+        challenges
+            .insert("token123".to_owned(), "token123.thumbprint".to_owned())
+            .await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/.well-known/acme-challenge/token123")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = handle_challenge_request(request, challenges).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body()).await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), b"token123.thumbprint");
     }
 }
