@@ -412,8 +412,8 @@ async fn spawn_anytls_inbound_with_padding(
 async fn connect_anytls_session(server: SocketAddr) -> anyhow::Result<SslStream<TcpStream>> {
     let tcp = TcpStream::connect(server).await?;
     let connector = tls::chrome_like_connector(true)?;
-    let ssl = connector.configure()?.into_ssl("localhost")?;
-    ssl.set_enable_ech_grease(true);
+    let mut ssl = connector.configure()?.into_ssl("localhost")?;
+    tls::configure_chrome_like_ssl(&mut ssl);
     let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
     anytls_codec::write_client_hello(&mut stream, "secret").await?;
     Ok(stream)

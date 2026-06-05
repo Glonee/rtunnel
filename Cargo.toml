@@ -8,8 +8,8 @@ license = "GPL-3.0-or-later"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 base64 = "0.22.1"
-boring = "4.15.0"
-boring-sys = "4.22.0"
+boring = { version = "4.22.0", features = ["pq-experimental"] }
+boring-sys = { version = "4.22.0", features = ["pq-experimental"] }
 brotli = "8.0"
 clap = { version = "4.5.38", features = ["derive"] }
 foreign-types = "0.5.0"
@@ -22,7 +22,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
 tokio = { version = "1.45.1", features = ["full"] }
-tokio-boring = "4.15.0"
+tokio-boring = "4.22.0"
 tokio-quiche = { version = "0.19.0", default-features = false }
 tokio-stream = "0.1.17"
 toml = "0.8.22"

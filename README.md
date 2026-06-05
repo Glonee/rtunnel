@@ -61,10 +61,13 @@ client config applies Chrome-like defaults where the public BoringSSL API allows
 - TLS 1.3 minimum preference with TLS 1.2 enabled for compatibility
 - Chrome-style ALPN list: `h2`, `http/1.1`
 - Broad modern cipher preference for TLS 1.2 fallback
-- X25519/P-256/P-384 curve order
+- Chrome 131+ supported group order: `X25519MLKEM768`, `X25519`, `P-256`, `P-384`
+- GREASE, shuffled extensions, ECH GREASE, OCSP stapling, SCTs, and Brotli
+  certificate decompression
 - SNI enabled
 
 This does not produce a byte-for-byte Chrome ClientHello. BoringSSL gives the
 same TLS implementation family Chrome uses, but exact Chrome fingerprints also
 depend on fields such as extension ordering, GREASE behavior, QUIC transport
-parameters, and version-specific Chrome details.
+parameters, ALPS codepoint/version details, PSK/resumption behavior, and
+version-specific Chrome details.

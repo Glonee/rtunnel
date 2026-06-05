@@ -45,13 +45,15 @@ const CHROME_SIGNATURE_ALGORITHMS: &str = "\
     rsa_pss_rsae_sha512:\
     rsa_pkcs1_sha512";
 
+const CHROME_SUPPORTED_GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
+
 pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls_client())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
     builder.set_cipher_list(CHROME_TLS12_CIPHERS)?;
-    builder.set_curves_list("X25519:P-256:P-384")?;
+    builder.set_curves_list(CHROME_SUPPORTED_GROUPS)?;
     builder.set_sigalgs_list(CHROME_SIGNATURE_ALGORITHMS)?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
@@ -63,6 +65,10 @@ pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
         builder.set_verify(SslVerifyMode::NONE);
     }
     Ok(builder.build())
+}
+
+pub fn configure_chrome_like_ssl(ssl: &mut SslRef) {
+    ssl.set_enable_ech_grease(true);
 }
 
 #[derive(Default)]
@@ -205,4 +211,17 @@ fn load_certificate_pair(
     let key = PKey::private_key_from_pem(&key_pem)
         .with_context(|| format!("failed to parse TLS private key {key_path}"))?;
     Ok((certs, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_like_connector_accepts_modern_chrome_groups() -> anyhow::Result<()> {
+        let connector = chrome_like_connector(true)?;
+        let mut ssl = connector.configure()?.into_ssl("example.com")?;
+        configure_chrome_like_ssl(&mut ssl);
+        Ok(())
+    }
 }
