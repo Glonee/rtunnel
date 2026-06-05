@@ -45,7 +45,7 @@ jobs:
           tar -xzf /tmp/sing-box.tar.gz -C /tmp/sing-box --strip-components=1
           /tmp/sing-box/sing-box version
 
-      - name: Build rtunel
+      - name: Build rtunnel
         run: cargo build --locked
 
       - name: Run sing-box interop

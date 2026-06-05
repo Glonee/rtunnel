@@ -2644,7 +2644,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtunel"
+name = "rtunnel"
 version = "0.1.0"
 dependencies = [
  "anyhow",

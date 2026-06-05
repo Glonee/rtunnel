@@ -210,7 +210,7 @@ fn default_acme_directory() -> String {
 }
 
 fn default_acme_cache_dir() -> PathBuf {
-    PathBuf::from(".rtunel/acme")
+    PathBuf::from(".rtunnel/acme")
 }
 
 fn default_acme_http_listen() -> SocketAddr {

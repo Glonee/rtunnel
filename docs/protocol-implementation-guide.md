@@ -1,6 +1,6 @@
 # Protocol Implementation Guide
 
-This guide is the expected path for adding or finishing a protocol in `rtunel`.
+This guide is the expected path for adding or finishing a protocol in `rtunnel`.
 The short version is: read the upstream spec, encode the wire format first,
 build inbound and outbound as separate protocol-owned modules, test them against
 each other, then prove both directions against sing-box.
@@ -15,9 +15,9 @@ A protocol is considered implemented only when all of these are true:
 - The config model can build both inbound and outbound instances.
 - Unit tests cover every encoder, decoder, and state-machine edge that can be
   tested without sockets.
-- Integration tests cover `rtunel` inbound against `rtunel` outbound.
-- Interop tests cover `rtunel` outbound against sing-box inbound.
-- Interop tests cover sing-box outbound against `rtunel` inbound.
+- Integration tests cover `rtunnel` inbound against `rtunnel` outbound.
+- Interop tests cover `rtunnel` outbound against sing-box inbound.
+- Interop tests cover sing-box outbound against `rtunnel` inbound.
 - Known unsupported spec features are documented before merge.
 
 ## Step 1: Read The Spec
@@ -36,7 +36,7 @@ Recommended sources:
 Write a small feature matrix before coding:
 
 ```text
-Feature                  Spec required  rtunel inbound  rtunel outbound  sing-box field/test
+Feature                  Spec required  rtunnel inbound  rtunnel outbound  sing-box field/test
 Authentication           yes            planned         planned          users/password
 TCP connect              yes            planned         planned          curl through SOCKS
 UDP native/datagram      optional       planned         planned          udp_relay_mode=native
@@ -167,7 +167,7 @@ Protocols with UDP support should implement `Outbound::dial_udp` and return a
 shared `ProxyDatagram` session. Keep target-addressed packet handling inside the
 protocol session, and cover it with both loopback and interop tests.
 
-## Step 6: Test Inside rtunel
+## Step 6: Test Inside rtunnel
 
 Run the fast checks first:
 
@@ -212,15 +212,15 @@ curl --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:18080/
 When client and server are on different machines, run the HTTP server on the
 server side or use a target address reachable from the server side.
 
-### Direction A: rtunel Outbound To sing-box Inbound
+### Direction A: rtunnel Outbound To sing-box Inbound
 
 1. Start sing-box as the protocol server.
-2. Start `rtunel` with a SOCKS inbound and the protocol outbound.
-3. Send traffic through `rtunel`'s local SOCKS inbound.
+2. Start `rtunnel` with a SOCKS inbound and the protocol outbound.
+3. Send traffic through `rtunnel`'s local SOCKS inbound.
 4. Confirm the target service receives traffic.
 5. Check both logs for auth, target address, and close behavior.
 
-Generic `rtunel` client config shape:
+Generic `rtunnel` client config shape:
 
 ```toml
 log_level = "debug"
@@ -245,9 +245,9 @@ default = "candidate-out"
 For TUIC, include `uuid`. For SOCKS, include `username` and `password` only when
 the sing-box inbound requires auth.
 
-### Direction B: sing-box Outbound To rtunel Inbound
+### Direction B: sing-box Outbound To rtunnel Inbound
 
-1. Start `rtunel` as the protocol server with direct outbound.
+1. Start `rtunnel` as the protocol server with direct outbound.
 2. Start sing-box with a SOCKS inbound and the protocol outbound.
 3. Send traffic through sing-box's local SOCKS inbound.
 4. Confirm the target service receives traffic.
@@ -466,7 +466,7 @@ SOCKS outbound:
 
 For each protocol and direction, record:
 
-- `rtunel` commit hash
+- `rtunnel` commit hash
 - sing-box version
 - OS and CPU architecture
 - protocol config files

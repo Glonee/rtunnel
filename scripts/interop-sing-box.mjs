@@ -9,7 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const RTUNEL_BIN = process.env.RTUNEL_BIN ?? path.join(ROOT, "target", "debug", "rtunel");
+const RTUNNEL_BIN = process.env.RTUNNEL_BIN ?? path.join(ROOT, "target", "debug", "rtunnel");
 const SING_BOX_BIN =
   process.env.SING_BOX_BIN ??
   [
@@ -23,19 +23,19 @@ const TUIC_UUID = "00000000-0000-0000-0000-000000000001";
 const TIMEOUT_MS = Number(process.env.INTEROP_TIMEOUT_MS ?? 8000);
 
 const cases = [
-  { protocol: "socks5", direction: "rtunel-out-to-sing-box-in" },
-  { protocol: "socks5", direction: "sing-box-out-to-rtunel-in" },
-  { protocol: "anytls", direction: "rtunel-out-to-sing-box-in" },
-  { protocol: "anytls", direction: "sing-box-out-to-rtunel-in" },
-  { protocol: "tuic", direction: "rtunel-out-to-sing-box-in" },
+  { protocol: "socks5", direction: "rtunnel-out-to-sing-box-in" },
+  { protocol: "socks5", direction: "sing-box-out-to-rtunnel-in" },
+  { protocol: "anytls", direction: "rtunnel-out-to-sing-box-in" },
+  { protocol: "anytls", direction: "sing-box-out-to-rtunnel-in" },
+  { protocol: "tuic", direction: "rtunnel-out-to-sing-box-in" },
   {
     protocol: "tuic",
-    direction: "sing-box-out-to-rtunel-in",
+    direction: "sing-box-out-to-rtunnel-in",
     singBoxUdpRelayMode: "native",
   },
   {
     protocol: "tuic",
-    direction: "sing-box-out-to-rtunel-in",
+    direction: "sing-box-out-to-rtunnel-in",
     singBoxUdpRelayMode: "quic",
   },
 ];
@@ -49,17 +49,17 @@ async function main() {
   if (!SING_BOX_BIN) {
     throw new Error("sing-box binary not found; set SING_BOX_BIN=/path/to/sing-box");
   }
-  if (!fs.existsSync(RTUNEL_BIN)) {
-    throw new Error(`rtunel binary not found at ${RTUNEL_BIN}; run cargo build first`);
+  if (!fs.existsSync(RTUNNEL_BIN)) {
+    throw new Error(`rtunnel binary not found at ${RTUNNEL_BIN}; run cargo build first`);
   }
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rtunel-sing-box-interop-"));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "rtunnel-sing-box-interop-"));
   const cert = createCertificate(tmpDir);
   const tcpEcho = await createTcpEchoServer();
   const udpEcho = await createUdpEchoServer();
   const results = [];
 
-  console.log(`rtunel: ${RTUNEL_BIN}`);
+  console.log(`rtunnel: ${RTUNNEL_BIN}`);
   console.log(`sing-box: ${SING_BOX_BIN}`);
   console.log(`workdir: ${tmpDir}`);
 
@@ -102,30 +102,30 @@ async function runCase(testCase, tmpDir, cert, tcpEcho, udpEcho) {
 
   const processes = [];
   try {
-    if (testCase.direction === "rtunel-out-to-sing-box-in") {
+    if (testCase.direction === "rtunnel-out-to-sing-box-in") {
       const singConfig = singBoxServerConfig(testCase.protocol, serverPort, cert);
-      const rtunelConfig = rtunelClientConfig(testCase.protocol, socksPort, serverPort);
+      const rtunnelConfig = rtunnelClientConfig(testCase.protocol, socksPort, serverPort);
       const singPath = writeJson(caseDir, "sing-box-server.json", singConfig);
-      const rtunelPath = writeText(caseDir, "rtunel-client.toml", rtunelConfig);
+      const rtunnelPath = writeText(caseDir, "rtunnel-client.toml", rtunnelConfig);
       const sing = spawnLogged("sing-box-server", SING_BOX_BIN, ["run", "-c", singPath], caseDir);
       processes.push(sing);
       await waitForProtocolServer(sing, testCase.protocol, serverPort);
-      const rtunel = spawnLogged("rtunel-client", RTUNEL_BIN, ["-c", rtunelPath], caseDir);
-      processes.push(rtunel);
-      await waitForTcpPort(socksPort, rtunel);
+      const rtunnel = spawnLogged("rtunnel-client", RTUNNEL_BIN, ["-c", rtunnelPath], caseDir);
+      processes.push(rtunnel);
+      await waitForTcpPort(socksPort, rtunnel);
     } else {
-      const rtunelConfig = rtunelServerConfig(testCase.protocol, serverPort, cert);
+      const rtunnelConfig = rtunnelServerConfig(testCase.protocol, serverPort, cert);
       const singConfig = singBoxClientConfig(
         testCase.protocol,
         socksPort,
         serverPort,
         testCase.singBoxUdpRelayMode,
       );
-      const rtunelPath = writeText(caseDir, "rtunel-server.toml", rtunelConfig);
+      const rtunnelPath = writeText(caseDir, "rtunnel-server.toml", rtunnelConfig);
       const singPath = writeJson(caseDir, "sing-box-client.json", singConfig);
-      const rtunel = spawnLogged("rtunel-server", RTUNEL_BIN, ["-c", rtunelPath], caseDir);
-      processes.push(rtunel);
-      await waitForProtocolServer(rtunel, testCase.protocol, serverPort);
+      const rtunnel = spawnLogged("rtunnel-server", RTUNNEL_BIN, ["-c", rtunnelPath], caseDir);
+      processes.push(rtunnel);
+      await waitForProtocolServer(rtunnel, testCase.protocol, serverPort);
       const sing = spawnLogged("sing-box-client", SING_BOX_BIN, ["run", "-c", singPath], caseDir);
       processes.push(sing);
       await waitForTcpPort(socksPort, sing);
@@ -243,7 +243,7 @@ function singBoxClientConfig(protocol, socksPort, serverPort, udpRelayMode = "na
   };
 }
 
-function rtunelClientConfig(protocol, socksPort, serverPort) {
+function rtunnelClientConfig(protocol, socksPort, serverPort) {
   const protocolName = protocol === "socks5" ? "socks5" : protocol;
   const extra =
     protocol === "anytls"
@@ -268,7 +268,7 @@ default = "${protocol}-out"
 `;
 }
 
-function rtunelServerConfig(protocol, port, cert) {
+function rtunnelServerConfig(protocol, port, cert) {
   if (protocol === "socks5") {
     return `log_level = "debug"
 

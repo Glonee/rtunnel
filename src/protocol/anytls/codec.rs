@@ -432,7 +432,7 @@ pub fn client_settings() -> Vec<u8> {
 }
 
 pub fn client_settings_with_padding_md5(padding_md5: &str) -> Vec<u8> {
-    format!("v=2\nclient=rtunel\npadding-md5={padding_md5}").into_bytes()
+    format!("v=2\nclient=rtunnel\npadding-md5={padding_md5}").into_bytes()
 }
 
 pub fn settings_version(data: &[u8]) -> Option<u8> {
@@ -730,7 +730,7 @@ mod tests {
         let settings = client_settings_with_padding_md5("abc123");
 
         assert_eq!(settings_version(&settings), Some(2));
-        assert_eq!(settings_value(&settings, "client"), Some("rtunel"));
+        assert_eq!(settings_value(&settings, "client"), Some("rtunnel"));
         assert_eq!(settings_value(&settings, "padding-md5"), Some("abc123"));
     }
 
