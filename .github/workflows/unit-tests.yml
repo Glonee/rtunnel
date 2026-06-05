@@ -1,0 +1,33 @@
+name: unit tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - src/**
+      - tests/**
+      - .github/workflows/unit-tests.yml
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - src/**
+      - tests/**
+      - .github/workflows/unit-tests.yml
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run cargo tests
+        run: cargo test --locked --all-targets
