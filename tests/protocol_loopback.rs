@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use rtunel::{
+use rtunnel::{
     config::{
         Config, InboundConfig, OutboundConfig, Protocol, RoutingConfig, TlsServerConfig, UserConfig,
     },
@@ -786,8 +786,8 @@ fn write_test_tls_files() -> anyhow::Result<TlsServerConfig> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
     );
-    let cert = std::env::temp_dir().join(format!("rtunel-{suffix}.crt"));
-    let key = std::env::temp_dir().join(format!("rtunel-{suffix}.key"));
+    let cert = std::env::temp_dir().join(format!("rtunnel-{suffix}.crt"));
+    let key = std::env::temp_dir().join(format!("rtunnel-{suffix}.key"));
     std::fs::write(&cert, CERT_PEM)?;
     std::fs::write(&key, KEY_PEM)?;
     Ok(TlsServerConfig {

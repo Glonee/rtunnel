@@ -1,6 +1,6 @@
-# rtunel
+# rtunnel
 
-`rtunel` is a Rust MVP for a sing-box-like proxy with protocol-specific inbound
+`rtunnel` is a Rust MVP for a sing-box-like proxy with protocol-specific inbound
 and outbound implementations.
 
 Supported:
