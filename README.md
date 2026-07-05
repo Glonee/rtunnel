@@ -70,8 +70,7 @@ TUIC/H3 uses a pinned quiche fork with BoringSSL 5.x support and opt-in
 fingerprint controls for ECH GREASE, h3 ALPS, and extra QUIC transport
 parameters. The outbound TUIC path advertises Chrome-like QUIC transport
 parameters, TLS application settings, signature algorithms, certificate
-compression, and supported groups. The fork is referenced over HTTPS in
-`Cargo.toml` so CI and fresh checkouts do not require SSH credentials.
+compression, and supported groups.
 
 Thumbprint probes currently classify the TCP h2 fingerprint as a slightly older
 Chrome/Chromium profile, and the TUIC/H3 TLS and QUIC transport-parameter
