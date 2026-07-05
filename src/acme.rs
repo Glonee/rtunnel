@@ -480,7 +480,7 @@ fn validate_certificate_pair_bytes(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::R
     let certs = X509::stack_from_pem(cert_pem)?;
     ensure!(!certs.is_empty(), "certificate chain is empty");
     let key = PKey::private_key_from_pem(key_pem)?;
-    let mut builder = SslContextBuilder::new(SslMethod::tls_server())?;
+    let mut builder = SslContextBuilder::new(SslMethod::tls())?;
     builder.set_certificate(&certs[0])?;
     builder.set_private_key(&key)?;
     builder.check_private_key()?;
