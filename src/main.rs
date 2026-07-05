@@ -2,17 +2,17 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
-use rtunel::{acme::AcmeManager, config::Config, protocol, router::Router};
+use rtunnel::{acme::AcmeManager, config::Config, protocol, router::Router};
 use tokio::signal;
 use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "rtunel",
+    name = "rtunnel",
     about = "A Rust proxy MVP with SOCKS5, AnyTLS, and TUIC"
 )]
 struct Args {
-    #[arg(short, long, default_value = "rtunel.toml")]
+    #[arg(short, long, default_value = "rtunnel.toml")]
     config: PathBuf,
 }
 
@@ -41,10 +41,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    info!("rtunel started");
+    info!("rtunnel started");
     signal::ctrl_c()
         .await
         .context("failed to wait for ctrl-c")?;
-    info!("rtunel stopped");
+    info!("rtunnel stopped");
     Ok(())
 }

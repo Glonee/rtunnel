@@ -2,7 +2,7 @@ log_level = "info"
 
 [acme]
 directory = "letsencrypt-staging"
-cache_dir = ".rtunel/acme"
+cache_dir = ".rtunnel/acme"
 http_listen = "0.0.0.0:80"
 renew_before_days = 30
 accept_terms = true
