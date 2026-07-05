@@ -32,8 +32,8 @@ tuic-core = { git = "https://github.com/Itsusinn/tuic", rev = "e38c357a0145a43c9
 upstream-anytls = { package = "anytls", version = "0.3.4", default-features = false, features = ["core"] }
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 
-# Temporary PR merge commit until https://github.com/cloudflare/quiche/pull/2446
-# lands in an upstream quiche/tokio-quiche release with boring 5.x support.
+# Temporary fork until upstream quiche has boring 5.x support plus the
+# opt-in TLS/QUIC fingerprint controls needed for Chrome-like H3.
 [patch.crates-io]
-quiche = { git = "https://github.com/cloudflare/quiche.git", rev = "9044e3b165c6bc863a6d4c55df51f03317ce393e" }
-tokio-quiche = { git = "https://github.com/cloudflare/quiche.git", rev = "9044e3b165c6bc863a6d4c55df51f03317ce393e" }
+quiche = { git = "https://github.com/Glonee/quiche.git", rev = "c6cb572fc9ada24cb744e2c97c3e174d4e3fb260" }
+tokio-quiche = { git = "https://github.com/Glonee/quiche.git", rev = "c6cb572fc9ada24cb744e2c97c3e174d4e3fb260" }

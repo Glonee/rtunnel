@@ -13,6 +13,7 @@ use boring::{
     },
     x509::X509,
 };
+use foreign_types::ForeignTypeRef;
 use tokio_quiche::{
     quic::ConnectionHook,
     settings::{Hooks, TlsCertificatePaths},
@@ -43,7 +44,16 @@ const CHROME_SIGNATURE_ALGORITHMS: &str = "\
     rsa_pss_rsae_sha384:\
     rsa_pkcs1_sha384:\
     rsa_pss_rsae_sha512:\
-    rsa_pkcs1_sha512";
+    rsa_pkcs1_sha512:\
+    rsa_pkcs1_sha1";
+
+const CHROME_SUPPORTED_GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
+const CHROME_H2_ALPS_SETTINGS: &[u8] = &[
+    0x00, 0x01, 0x00, 0x00, 0x01, 0x00, // HEADER_TABLE_SIZE = 65536
+    0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // ENABLE_PUSH = 0
+    0x00, 0x04, 0x00, 0x60, 0x00, 0x00, // INITIAL_WINDOW_SIZE = 6291456
+    0x00, 0x06, 0x00, 0x04, 0x00, 0x00, // MAX_HEADER_LIST_SIZE = 262144
+];
 
 pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
@@ -51,7 +61,7 @@ pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
     builder.set_cipher_list(CHROME_TLS12_CIPHERS)?;
-    builder.set_curves_list("X25519:P-256:P-384")?;
+    builder.set_curves_list(CHROME_SUPPORTED_GROUPS)?;
     builder.set_sigalgs_list(CHROME_SIGNATURE_ALGORITHMS)?;
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
@@ -63,6 +73,45 @@ pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
         builder.set_verify(SslVerifyMode::NONE);
     }
     Ok(builder.build())
+}
+
+pub fn configure_chrome_like_ssl(ssl: &mut SslRef) -> anyhow::Result<()> {
+    ssl.set_enable_ech_grease(true);
+    let added_alps = unsafe {
+        boring_sys::SSL_add_application_settings(
+            ssl.as_ptr(),
+            b"h2".as_ptr(),
+            2,
+            CHROME_H2_ALPS_SETTINGS.as_ptr(),
+            CHROME_H2_ALPS_SETTINGS.len(),
+        )
+    };
+    ensure!(
+        added_alps == 1,
+        "failed to enable h2 ALPS application settings"
+    );
+    Ok(())
+}
+
+pub fn chrome_quic_client_hooks() -> Hooks {
+    Hooks {
+        connection_hook: Some(Arc::new(ChromeQuicClientHook)),
+        ..Hooks::default()
+    }
+}
+
+pub fn chrome_like_quic_client_context() -> anyhow::Result<SslContextBuilder> {
+    let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    builder.set_curves_list(CHROME_SUPPORTED_GROUPS)?;
+    builder.set_sigalgs_list(CHROME_SIGNATURE_ALGORITHMS)?;
+    builder.set_grease_enabled(true);
+    builder.set_permute_extensions(true);
+    builder.add_certificate_compression_algorithm(BrotliCertificateDecompressor)?;
+    builder.set_default_verify_paths()?;
+    builder.set_options(SslOptions::NO_COMPRESSION);
+    Ok(builder)
 }
 
 #[derive(Default)]
@@ -111,6 +160,28 @@ pub fn quic_hooks(tls: &TlsServerConfig) -> anyhow::Result<Hooks> {
 struct ReloadingCertificateHook {
     cert_path: String,
     key_path: String,
+}
+
+#[derive(Debug)]
+struct ChromeQuicClientHook;
+
+impl ConnectionHook for ChromeQuicClientHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        _settings: TlsCertificatePaths<'_>,
+    ) -> Option<SslContextBuilder> {
+        None
+    }
+
+    fn create_custom_client_ssl_context_builder(&self) -> Option<SslContextBuilder> {
+        match chrome_like_quic_client_context() {
+            Ok(builder) => Some(builder),
+            Err(err) => {
+                debug!(%err, "failed to create Chrome-like QUIC TLS context");
+                None
+            }
+        }
+    }
 }
 
 impl ConnectionHook for ReloadingCertificateHook {
@@ -205,4 +276,23 @@ fn load_certificate_pair(
     let key = PKey::private_key_from_pem(&key_pem)
         .with_context(|| format!("failed to parse TLS private key {key_path}"))?;
     Ok((certs, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_like_connector_accepts_modern_chrome_groups() -> anyhow::Result<()> {
+        let connector = chrome_like_connector(true)?;
+        let mut ssl = connector.configure()?.into_ssl("example.com")?;
+        configure_chrome_like_ssl(&mut ssl)?;
+        Ok(())
+    }
+
+    #[test]
+    fn chrome_like_quic_client_context_accepts_modern_chrome_groups() -> anyhow::Result<()> {
+        chrome_like_quic_client_context()?;
+        Ok(())
+    }
 }

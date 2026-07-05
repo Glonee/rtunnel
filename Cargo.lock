@@ -664,7 +664,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 [[package]]
 name = "datagram-socket"
 version = "0.8.0"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 dependencies = [
  "bytes",
  "futures-util",
@@ -818,7 +818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1637,7 +1637,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1990,7 +1990,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.5"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 
 [[package]]
 name = "oid-registry"
@@ -2339,7 +2339,7 @@ dependencies = [
 [[package]]
 name = "qlog"
 version = "0.18.0"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 dependencies = [
  "foundations",
  "humantime",
@@ -2366,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.29.2"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 dependencies = [
  "boring",
  "bytes",
@@ -2401,7 +2401,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2448,9 +2448,9 @@ source = "git+https://github.com/Tipuch/quinn.git?branch=bbrv3#ce60e5b5c115db2a6
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2768,7 +2768,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3228,7 +3228,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "task-killswitch"
 version = "0.2.1"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 dependencies = [
  "dashmap",
  "parking_lot",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "tokio-quiche"
 version = "0.19.0"
-source = "git+https://github.com/cloudflare/quiche.git?rev=9044e3b165c6bc863a6d4c55df51f03317ce393e#9044e3b165c6bc863a6d4c55df51f03317ce393e"
+source = "git+https://github.com/Glonee/quiche.git?rev=c6cb572fc9ada24cb744e2c97c3e174d4e3fb260#c6cb572fc9ada24cb744e2c97c3e174d4e3fb260"
 dependencies = [
  "anyhow",
  "boring",
