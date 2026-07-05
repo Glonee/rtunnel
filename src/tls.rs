@@ -46,7 +46,7 @@ const CHROME_SIGNATURE_ALGORITHMS: &str = "\
     rsa_pkcs1_sha512";
 
 pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
@@ -84,7 +84,7 @@ impl CertificateCompressor for BrotliCertificateDecompressor {
 pub fn server_acceptor(tls: &TlsServerConfig) -> anyhow::Result<SslAcceptor> {
     let cert_path = tls.certificate_path()?.to_owned();
     let key_path = tls.private_key_path()?.to_owned();
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())?;
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
     load_certificate_into_context(&mut builder, &cert_path, &key_path)?;
     if tls.acme.is_some() {
         install_certificate_reload_callback(&mut builder, cert_path, key_path);
@@ -118,7 +118,7 @@ impl ConnectionHook for ReloadingCertificateHook {
         &self,
         _settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        let mut builder = match SslContextBuilder::new(SslMethod::tls_server()) {
+        let mut builder = match SslContextBuilder::new(SslMethod::tls()) {
             Ok(builder) => builder,
             Err(err) => {
                 debug!(%err, "failed to create QUIC TLS context for ACME certificate reload");
