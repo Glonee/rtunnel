@@ -56,7 +56,7 @@ are logged and retried later.
 ## TLS fingerprinting
 
 TLS is backed by BoringSSL through the `boring` and `tokio-boring` crates. The
-client config applies Chrome-like defaults where the public BoringSSL API allows:
+client config applies Chrome-like defaults for TCP TLS and TUIC/H3:
 
 - TLS 1.3 minimum preference with TLS 1.2 enabled for compatibility
 - Chrome-style ALPN list: `h2`, `http/1.1`
@@ -66,8 +66,18 @@ client config applies Chrome-like defaults where the public BoringSSL API allows
   Brotli certificate decompression
 - SNI enabled
 
-This does not produce a byte-for-byte Chrome ClientHello. BoringSSL gives the
-same TLS implementation family Chrome uses, but exact Chrome fingerprints also
-depend on fields such as extension ordering, GREASE behavior, QUIC transport
-parameters, Chrome's newest post-quantum signature algorithm advertisements,
-PSK/resumption behavior, and version-specific Chrome details.
+TUIC/H3 uses a pinned quiche fork with BoringSSL 5.x support and opt-in
+fingerprint controls for ECH GREASE, h3 ALPS, and extra QUIC transport
+parameters. The outbound TUIC path advertises Chrome-like QUIC transport
+parameters, TLS application settings, signature algorithms, certificate
+compression, and supported groups. The fork is referenced over HTTPS in
+`Cargo.toml` so CI and fresh checkouts do not require SSH credentials.
+
+Thumbprint probes currently classify the TCP h2 fingerprint as a slightly older
+Chrome/Chromium profile, and the TUIC/H3 TLS and QUIC transport-parameter
+fingerprints as Chrome 149-family profiles.
+
+These settings are fingerprint-sensitive rather than a guarantee of byte-for-byte
+Chrome behavior. Chrome fingerprints can change between releases, and fields
+such as extension ordering, GREASE behavior, PSK/resumption, HTTP headers, and
+future post-quantum advertisements may need periodic re-verification.
