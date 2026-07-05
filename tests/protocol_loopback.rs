@@ -413,7 +413,7 @@ async fn connect_anytls_session(server: SocketAddr) -> anyhow::Result<SslStream<
     let tcp = TcpStream::connect(server).await?;
     let connector = tls::chrome_like_connector(true)?;
     let mut ssl = connector.configure()?.into_ssl("localhost")?;
-    tls::configure_chrome_like_ssl(&mut ssl);
+    tls::configure_chrome_like_ssl(&mut ssl)?;
     let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
     anytls_codec::write_client_hello(&mut stream, "secret").await?;
     Ok(stream)

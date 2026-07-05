@@ -79,7 +79,7 @@ impl AnytlsOutbound {
             .as_deref()
             .context("anytls outbound requires server_name")?;
         let mut ssl = connector.configure()?.into_ssl(server_name)?;
-        tls::configure_chrome_like_ssl(&mut ssl);
+        tls::configure_chrome_like_ssl(&mut ssl)?;
         let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
         let password = self
             .cfg
