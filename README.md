@@ -1,26 +1,23 @@
 # rtunnel
 
-`rtunnel` is a Rust MVP for a sing-box-like proxy with protocol-specific inbound
-and outbound implementations.
+`rtunnel` is a Rust sing-box-like proxy with protocol-specific inbound and
+outbound implementations.
 
 Supported:
 
-- SOCKS5 inbound and outbound over TCP
+- SOCKS5 inbound and outbound with TCP CONNECT and UDP ASSOCIATE
 - AnyTLS inbound and outbound over BoringSSL with TLS-exporter auth and binary
-  CONNECT framing
+  CONNECT framing, UDP relay over streams, and negotiated client-side packet
+  padding and splitting
 - TUIC v5 inbound and outbound over `tokio-quiche`, including TCP relay,
   authentication, heartbeat, and UDP packet relay modes
+- Direct TCP and UDP outbound
 - ACME HTTP-01 certificates for AnyTLS and TUIC inbounds, with cached PEM files
   and hot reload for new TLS handshakes
 - A TOML config format with route rules and default outbound selection
 
 For the expected workflow when adding or completing a protocol, see
 [`docs/protocol-implementation-guide.md`](docs/protocol-implementation-guide.md).
-
-The SOCKS5, AnyTLS, and TUIC TCP CONNECT paths are runnable today. UDP associate
-is available through the shared datagram outbound path. AnyTLS applies the
-negotiated client-side packet padding and splitting scheme during early session
-writes.
 
 ## Run
 
@@ -55,13 +52,13 @@ are logged and retried later.
 
 ## TLS fingerprinting
 
-TLS is backed by BoringSSL through the `boring` and `tokio-boring` crates. The
-client config applies Chrome-like defaults for TCP TLS and TUIC/H3:
+TLS is backed by BoringSSL through the `boring` and `tokio-boring` crates. TCP
+TLS outbounds apply Chrome-like defaults:
 
 - TLS 1.3 minimum preference with TLS 1.2 enabled for compatibility
 - Chrome-style ALPN list: `h2`, `http/1.1`
 - Broad modern cipher preference for TLS 1.2 fallback
-- Chrome 131+ supported group order: `X25519MLKEM768`, `X25519`, `P-256`, `P-384`
+- Chrome-style supported group order: `X25519MLKEM768`, `X25519`, `P-256`, `P-384`
 - GREASE, shuffled extensions, ECH GREASE, h2 ALPS, OCSP stapling, SCTs, and
   Brotli certificate decompression
 - SNI enabled
