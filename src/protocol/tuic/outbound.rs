@@ -17,7 +17,7 @@ use tokio_quiche::{
     ApplicationOverQuic, QuicResult,
     quic::{HandshakeInfo, QuicheConnection, connect_with_config},
     quiche,
-    settings::{ConnectionParams, Hooks},
+    settings::ConnectionParams,
     socket::Socket,
 };
 use tracing::debug;
@@ -28,6 +28,7 @@ use crate::{
     protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
     router::Outbound,
     session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
+    tls,
 };
 
 const CONNECT_STREAM_ID: u64 = 0;
@@ -89,7 +90,7 @@ impl Outbound for TuicOutbound {
 
         let mut settings = quic_settings();
         settings.verify_peer = !self.cfg.insecure;
-        let params = ConnectionParams::new_client(settings, None, Hooks::default());
+        let params = ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks());
 
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
         let (mut app_reader, mut app_writer) = tokio::io::split(relay_side);
@@ -166,7 +167,7 @@ impl Outbound for TuicOutbound {
 
         let mut settings = quic_settings();
         settings.verify_peer = !self.cfg.insecure;
-        let params = ConnectionParams::new_client(settings, None, Hooks::default());
+        let params = ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks());
 
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let (response_tx, response_rx) = mpsc::unbounded_channel();
