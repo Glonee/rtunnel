@@ -90,7 +90,8 @@ impl AnytlsOutbound {
 
     async fn connect_session(&self) -> anyhow::Result<Arc<ClientSession>> {
         let tcp = TcpStream::connect(self.cfg.require_server()?).await?;
-        let connector = tls::chrome_like_connector(self.cfg.insecure)?;
+        let connector =
+            tls::chrome_like_connector(self.cfg.insecure, self.cfg.ca_certificate.as_deref())?;
         let server_name = self
             .cfg
             .server_name

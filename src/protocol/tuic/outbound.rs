@@ -92,7 +92,11 @@ impl Outbound for TuicOutbound {
 
         let mut settings = quic_settings();
         settings.verify_peer = !self.cfg.insecure;
-        let params = ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks());
+        let params = ConnectionParams::new_client(
+            settings,
+            None,
+            tls::chrome_quic_client_hooks(self.cfg.ca_certificate.as_deref()),
+        );
 
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
         let (mut app_reader, mut app_writer) = tokio::io::split(relay_side);
@@ -175,7 +179,11 @@ impl Outbound for TuicOutbound {
 
         let mut settings = quic_settings();
         settings.verify_peer = !self.cfg.insecure;
-        let params = ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks());
+        let params = ConnectionParams::new_client(
+            settings,
+            None,
+            tls::chrome_quic_client_hooks(self.cfg.ca_certificate.as_deref()),
+        );
 
         let (write_tx, write_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
         let (response_tx, response_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);

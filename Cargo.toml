@@ -32,6 +32,9 @@ tuic-core = { git = "https://github.com/Itsusinn/tuic", rev = "e38c357a0145a43c9
 upstream-anytls = { package = "anytls", version = "0.3.4", default-features = false, features = ["core"] }
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 
+[dev-dependencies]
+rcgen = "0.14.8"
+
 # Temporary fork until upstream quiche has boring 5.x support plus the
 # opt-in TLS/QUIC fingerprint controls needed for Chrome-like H3.
 [patch.crates-io]
