@@ -1,11 +1,13 @@
 use std::{
-    fs,
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use anyhow::{Context, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
+use tokio::net::{TcpStream, lookup_host};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -67,7 +69,7 @@ pub struct InboundConfig {
 pub struct OutboundConfig {
     pub tag: String,
     pub protocol: Protocol,
-    pub server: Option<SocketAddr>,
+    pub server: Option<ServerAddr>,
     pub server_name: Option<String>,
     #[serde(default)]
     pub insecure: bool,
@@ -78,9 +80,137 @@ pub struct OutboundConfig {
 }
 
 impl OutboundConfig {
-    pub fn require_server(&self) -> anyhow::Result<SocketAddr> {
+    pub fn require_server(&self) -> anyhow::Result<&ServerAddr> {
         self.server
+            .as_ref()
             .with_context(|| format!("outbound {} requires server", self.tag))
+    }
+
+    pub fn tls_server_name(&self) -> anyhow::Result<&str> {
+        self.server_name
+            .as_deref()
+            .or_else(|| self.server.as_ref().and_then(ServerAddr::domain))
+            .with_context(|| format!("outbound {} requires server_name", self.tag))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerAddr {
+    host: ServerHost,
+    port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ServerHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+impl ServerAddr {
+    pub fn host(&self) -> String {
+        match &self.host {
+            ServerHost::Ip(ip) => ip.to_string(),
+            ServerHost::Domain(domain) => domain.clone(),
+        }
+    }
+
+    pub fn domain(&self) -> Option<&str> {
+        match &self.host {
+            ServerHost::Ip(_) => None,
+            ServerHost::Domain(domain) => Some(domain.as_str()),
+        }
+    }
+
+    pub async fn resolve(&self) -> anyhow::Result<SocketAddr> {
+        match &self.host {
+            ServerHost::Ip(ip) => Ok(SocketAddr::new(*ip, self.port)),
+            ServerHost::Domain(domain) => {
+                let mut addrs = lookup_host((domain.as_str(), self.port))
+                    .await
+                    .with_context(|| format!("failed to resolve server {self}"))?;
+                addrs
+                    .next()
+                    .with_context(|| format!("server {self} did not resolve to any address"))
+            }
+        }
+    }
+
+    pub async fn connect_tcp(&self) -> anyhow::Result<TcpStream> {
+        match &self.host {
+            ServerHost::Ip(ip) => TcpStream::connect(SocketAddr::new(*ip, self.port))
+                .await
+                .with_context(|| format!("failed to connect to server {self}")),
+            ServerHost::Domain(domain) => TcpStream::connect((domain.as_str(), self.port))
+                .await
+                .with_context(|| format!("failed to connect to server {self}")),
+        }
+    }
+}
+
+impl From<SocketAddr> for ServerAddr {
+    fn from(value: SocketAddr) -> Self {
+        Self {
+            host: ServerHost::Ip(value.ip()),
+            port: value.port(),
+        }
+    }
+}
+
+impl FromStr for ServerAddr {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        ensure!(!value.is_empty(), "server must not be empty");
+        ensure!(
+            value.trim() == value,
+            "server must not contain leading or trailing whitespace"
+        );
+
+        if let Ok(addr) = value.parse::<SocketAddr>() {
+            return Ok(addr.into());
+        }
+
+        let (host, port) = value
+            .rsplit_once(':')
+            .with_context(|| format!("server {value:?} must include a port"))?;
+        ensure!(!host.is_empty(), "server {value:?} is missing a host");
+        ensure!(!port.is_empty(), "server {value:?} is missing a port");
+        ensure!(
+            !host.contains(':'),
+            "server {value:?} contains ':' in the host; wrap IPv6 addresses in brackets"
+        );
+        ensure!(
+            !host.contains(char::is_whitespace),
+            "server {value:?} contains whitespace in the host"
+        );
+
+        let port = port
+            .parse::<u16>()
+            .with_context(|| format!("server {value:?} has an invalid port"))?;
+
+        Ok(Self {
+            host: ServerHost::Domain(host.to_owned()),
+            port,
+        })
+    }
+}
+
+impl fmt::Display for ServerAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.host {
+            ServerHost::Ip(ip) => write!(f, "{}", SocketAddr::new(*ip, self.port)),
+            ServerHost::Domain(domain) => write!(f, "{domain}:{}", self.port),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
     }
 }
 
@@ -270,6 +400,45 @@ default = "direct"
             .unwrap()
             .domains;
         assert_eq!(domains.as_slice(), &[String::from("proxy.example.com")]);
+    }
+
+    #[test]
+    fn parses_domain_outbound_server() {
+        let raw = r#"
+[[inbounds]]
+tag = "socks-in"
+listen = "127.0.0.1:1080"
+protocol = "socks5"
+
+[[outbounds]]
+tag = "proxy"
+protocol = "socks5"
+server = "proxy.example.com:1080"
+
+[routing]
+default = "proxy"
+"#;
+
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let server = cfg.outbounds[0].server.as_ref().unwrap();
+
+        assert_eq!(server.to_string(), "proxy.example.com:1080");
+        assert_eq!(server.domain(), Some("proxy.example.com"));
+    }
+
+    #[test]
+    fn parses_ip_outbound_server() {
+        let server: ServerAddr = "[::1]:443".parse().unwrap();
+
+        assert_eq!(server.to_string(), "[::1]:443");
+        assert_eq!(server.domain(), None);
+    }
+
+    #[test]
+    fn rejects_domain_outbound_server_without_port() {
+        let err = "proxy.example.com".parse::<ServerAddr>().unwrap_err();
+
+        assert!(err.to_string().contains("must include a port"));
     }
 
     #[test]

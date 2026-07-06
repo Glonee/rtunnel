@@ -80,14 +80,16 @@ impl Outbound for TuicOutbound {
             .server_name
             .as_deref()
             .map(str::to_owned)
-            .unwrap_or_else(|| server.ip().to_string());
-        let socket = UdpSocket::bind(if server.is_ipv4() {
+            .unwrap_or_else(|| server.host());
+        let server_label = server.to_string();
+        let server_addr = server.resolve().await?;
+        let socket = UdpSocket::bind(if server_addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
         })
         .await?;
-        socket.connect(server).await?;
+        socket.connect(server_addr).await?;
         let socket = Socket::try_from(socket)?;
 
         let mut settings = quic_settings();
@@ -148,7 +150,7 @@ impl Outbound for TuicOutbound {
             })?;
         debug!(
             tag = %self.cfg.tag,
-            server = %server,
+            server = %server_label,
             "tuic outbound connected"
         );
 
@@ -167,14 +169,15 @@ impl Outbound for TuicOutbound {
             .server_name
             .as_deref()
             .map(str::to_owned)
-            .unwrap_or_else(|| server.ip().to_string());
-        let socket = UdpSocket::bind(if server.is_ipv4() {
+            .unwrap_or_else(|| server.host());
+        let server_addr = server.resolve().await?;
+        let socket = UdpSocket::bind(if server_addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
         })
         .await?;
-        socket.connect(server).await?;
+        socket.connect(server_addr).await?;
         let socket = Socket::try_from(socket)?;
 
         let mut settings = quic_settings();

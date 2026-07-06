@@ -30,6 +30,9 @@ cargo run -- -c examples/socks.toml
 
 Then point a SOCKS5 client at `127.0.0.1:1080`.
 
+Outbound `server` values accept either an IP socket address such as
+`127.0.0.1:8443` or a domain endpoint such as `proxy.example.com:8443`.
+
 ## ACME certificates
 
 AnyTLS and TUIC inbounds can use ACME instead of static certificate files:

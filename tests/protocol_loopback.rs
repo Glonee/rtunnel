@@ -48,7 +48,7 @@ async fn socks5_outbound_reaches_socks5_inbound() -> anyhow::Result<()> {
     let client = Socks5Outbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Socks5,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: None,
         insecure: false,
         ca_certificate: None,
@@ -67,7 +67,7 @@ async fn socks5_outbound_authenticates_to_socks5_inbound() -> anyhow::Result<()>
     let client = Socks5Outbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Socks5,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: None,
         insecure: false,
         ca_certificate: None,
@@ -86,7 +86,7 @@ async fn socks5_udp_reaches_socks5_inbound() -> anyhow::Result<()> {
     let client = Socks5Outbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Socks5,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: None,
         insecure: false,
         ca_certificate: None,
@@ -105,7 +105,7 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: Some("localhost".to_owned()),
         insecure: false,
         ca_certificate: Some(ca_certificate),
@@ -124,7 +124,7 @@ async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: Some("localhost".to_owned()),
         insecure: false,
         ca_certificate: Some(ca_certificate),
@@ -195,7 +195,7 @@ async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Re
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
-        server: Some(server),
+        server: Some(server.into()),
         server_name: Some("localhost".to_owned()),
         insecure: false,
         ca_certificate: Some(ca_certificate),
@@ -241,7 +241,7 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     let client = TuicOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Tuic,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: Some("localhost".to_owned()),
         insecure: false,
         ca_certificate: Some(ca_certificate),
@@ -260,7 +260,7 @@ async fn tuic_udp_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     let client = TuicOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Tuic,
-        server: Some(inbound_addr),
+        server: Some(inbound_addr.into()),
         server_name: Some("localhost".to_owned()),
         insecure: false,
         ca_certificate: Some(ca_certificate),

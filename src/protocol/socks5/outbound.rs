@@ -49,7 +49,7 @@ impl Outbound for Socks5Outbound {
             matches!(session.command, Command::UdpAssociate),
             "socks5 outbound udp only supports UDP associate"
         );
-        let server = self.cfg.require_server()?;
+        let server = self.cfg.require_server()?.resolve().await?;
         let mut control = self.connect_control().await?;
         let bind_target = TargetAddr::Ip(SocketAddr::new(
             if server.is_ipv6() {
@@ -82,7 +82,7 @@ impl Outbound for Socks5Outbound {
 
 impl Socks5Outbound {
     async fn connect_control(&self) -> anyhow::Result<TcpStream> {
-        let mut stream = TcpStream::connect(self.cfg.require_server()?).await?;
+        let mut stream = self.cfg.require_server()?.connect_tcp().await?;
         let auth = self.cfg.username.is_some() || self.cfg.password.is_some();
         if auth {
             stream.write_all(&[codec::VERSION, 0x01, 0x02]).await?;
