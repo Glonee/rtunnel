@@ -2,8 +2,6 @@ pub mod codec;
 pub mod inbound;
 pub mod outbound;
 
-use std::time::Duration;
-
 use tokio_quiche::settings::{ExtraTransportParam, QuicSettings, TlsApplicationSettings};
 
 const CHROME_H3_ALPS_SETTINGS: &[u8] = &[];
@@ -35,5 +33,3 @@ pub fn quic_settings() -> QuicSettings {
     settings.disable_active_migration = false;
     settings
 }
-
-pub const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);

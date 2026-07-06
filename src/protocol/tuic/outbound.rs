@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     config::OutboundConfig,
-    protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
+    protocol::tuic::{codec, quic_settings},
     router::Outbound,
     session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
     tls,
@@ -34,6 +34,8 @@ use crate::{
 const CONNECT_STREAM_ID: u64 = 0;
 const AUTH_STREAM_ID: u64 = 2;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const CHANNEL_CAPACITY: usize = 32;
+const UDP_CHANNEL_CAPACITY: usize = 128;
 
 pub struct TuicOutbound {
     cfg: OutboundConfig,
@@ -94,8 +96,8 @@ impl Outbound for TuicOutbound {
 
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
         let (mut app_reader, mut app_writer) = tokio::io::split(relay_side);
-        let (quic_tx, quic_rx) = mpsc::unbounded_channel();
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (quic_tx, quic_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let target = session.target.clone();
 
         tokio::spawn({
@@ -105,14 +107,20 @@ impl Outbound for TuicOutbound {
                 loop {
                     match app_reader.read(&mut buf).await {
                         Ok(0) => {
-                            let _ = quic_tx.send(QuicWrite::Close);
+                            let _ = quic_tx.send(QuicWrite::Close).await;
                             break;
                         }
                         Ok(n) => {
-                            let _ = quic_tx.send(QuicWrite::Data(buf[..n].to_vec()));
+                            if quic_tx
+                                .send(QuicWrite::Data(buf[..n].to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         Err(_) => {
-                            let _ = quic_tx.send(QuicWrite::Close);
+                            let _ = quic_tx.send(QuicWrite::Close).await;
                             break;
                         }
                     }
@@ -169,8 +177,8 @@ impl Outbound for TuicOutbound {
         settings.verify_peer = !self.cfg.insecure;
         let params = ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks());
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
+        let (response_tx, response_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
         let app = TuicUdpOutboundApp::new(self.uuid, self.password.clone(), write_rx, response_tx);
         connect_with_config(socket, Some(server_name.as_str()), &params, app)
             .await
@@ -190,8 +198,8 @@ struct TuicClientApp {
     uuid: Uuid,
     password: String,
     target: TargetAddr,
-    outbound_rx: mpsc::UnboundedReceiver<QuicWrite>,
-    stream_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbound_rx: mpsc::Receiver<QuicWrite>,
+    stream_tx: mpsc::Sender<Vec<u8>>,
     pending_writes: VecDeque<QuicWrite>,
     next_heartbeat: Instant,
     buffer: [u8; 16 * 1024],
@@ -208,8 +216,8 @@ impl TuicClientApp {
         uuid: Uuid,
         password: String,
         target: TargetAddr,
-        outbound_rx: mpsc::UnboundedReceiver<QuicWrite>,
-        stream_tx: mpsc::UnboundedSender<Vec<u8>>,
+        outbound_rx: mpsc::Receiver<QuicWrite>,
+        stream_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
             uuid,
@@ -279,7 +287,6 @@ impl ApplicationOverQuic for TuicClientApp {
                     self.pending_writes.push_back(QuicWrite::Heartbeat);
                     self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
                 }
-                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
             }
         }
         Ok(())
@@ -291,8 +298,14 @@ impl ApplicationOverQuic for TuicClientApp {
                 let mut buf = [0; 16 * 1024];
                 match qconn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
-                        if stream_id == CONNECT_STREAM_ID && read > 0 {
-                            let _ = self.stream_tx.send(buf[..read].to_vec());
+                        if stream_id == CONNECT_STREAM_ID
+                            && read > 0
+                            && let Err(err) = self.stream_tx.try_send(buf[..read].to_vec())
+                        {
+                            return Err(anyhow::anyhow!(
+                                "tuic outbound receive queue backpressure: {err}"
+                            )
+                            .into());
                         }
                         if fin {
                             break;
@@ -352,8 +365,8 @@ impl ApplicationOverQuic for TuicClientApp {
 }
 
 struct TuicUdpSession {
-    write_tx: mpsc::UnboundedSender<TuicUdpWrite>,
-    response_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(TargetAddr, Vec<u8>)>>,
+    write_tx: mpsc::Sender<TuicUdpWrite>,
+    response_rx: tokio::sync::Mutex<mpsc::Receiver<(TargetAddr, Vec<u8>)>>,
     pkt_id: AtomicU16,
 }
 
@@ -368,7 +381,10 @@ impl ProxyDatagram for TuicUdpSession {
             target: Some(target.clone()),
             payload: payload.to_vec(),
         };
-        self.write_tx.send(TuicUdpWrite::Packet(packet))?;
+        self.write_tx
+            .send(TuicUdpWrite::Packet(packet))
+            .await
+            .map_err(|_| anyhow::anyhow!("tuic udp session closed"))?;
         Ok(())
     }
 
@@ -388,8 +404,8 @@ enum TuicUdpWrite {
 struct TuicUdpOutboundApp {
     uuid: Uuid,
     password: String,
-    outbound_rx: mpsc::UnboundedReceiver<TuicUdpWrite>,
-    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    outbound_rx: mpsc::Receiver<TuicUdpWrite>,
+    response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
     pending_writes: VecDeque<TuicUdpWrite>,
     packet_assembler: codec::PacketAssembler,
     stream_buffers: HashMap<u64, Vec<u8>>,
@@ -401,8 +417,8 @@ impl TuicUdpOutboundApp {
     fn new(
         uuid: Uuid,
         password: String,
-        outbound_rx: mpsc::UnboundedReceiver<TuicUdpWrite>,
-        response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+        outbound_rx: mpsc::Receiver<TuicUdpWrite>,
+        response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
     ) -> Self {
         Self {
             uuid,
@@ -423,7 +439,9 @@ impl TuicUdpOutboundApp {
             let Some(source) = packet.target else {
                 return Err(anyhow::anyhow!("tuic udp response missing source").into());
             };
-            let _ = self.response_tx.send((source, packet.payload));
+            if let Err(err) = self.response_tx.try_send((source, packet.payload)) {
+                debug!(%err, "dropped tuic udp response due to receive backpressure");
+            }
         }
         Ok(())
     }
@@ -461,7 +479,6 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
                     self.pending_writes.push_back(TuicUdpWrite::Heartbeat);
                     self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
                 }
-                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
             }
         }
         Ok(())

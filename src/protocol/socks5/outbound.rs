@@ -15,6 +15,8 @@ use crate::{
     session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
 };
 
+const UDP_BUFFER_SIZE: usize = 64 * 1024;
+
 pub struct Socks5Outbound {
     cfg: OutboundConfig,
 }
@@ -73,6 +75,7 @@ impl Outbound for Socks5Outbound {
             _control: Mutex::new(control),
             socket,
             relay,
+            recv_buf: Mutex::new(vec![0; UDP_BUFFER_SIZE]),
         }))
     }
 }
@@ -176,6 +179,7 @@ struct Socks5UdpSession {
     _control: Mutex<TcpStream>,
     socket: UdpSocket,
     relay: SocketAddr,
+    recv_buf: Mutex<Vec<u8>>,
 }
 
 #[async_trait]
@@ -187,9 +191,9 @@ impl ProxyDatagram for Socks5UdpSession {
     }
 
     async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)> {
-        let mut buf = vec![0; 64 * 1024];
+        let mut buf = self.recv_buf.lock().await;
         loop {
-            let (read, source) = self.socket.recv_from(&mut buf).await?;
+            let (read, source) = self.socket.recv_from(buf.as_mut_slice()).await?;
             if source != self.relay {
                 continue;
             }

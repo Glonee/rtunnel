@@ -155,6 +155,21 @@ pub fn parse_padding_plan(lines: &[String]) -> anyhow::Result<PaddingPlan> {
 }
 
 impl PaddingPlan {
+    pub fn md5(&self) -> &str {
+        self.factory.md5()
+    }
+
+    pub fn padding0_len(&self) -> anyhow::Result<u16> {
+        let Some(GeneratedPaddingStep::Size(size)) = self
+            .generate_record_payload_steps(0)?
+            .into_iter()
+            .find(|step| matches!(step, GeneratedPaddingStep::Size(_)))
+        else {
+            return Ok(30);
+        };
+        Ok(size as u16)
+    }
+
     pub fn generate_record_payload_steps(
         &self,
         packet: u32,
@@ -471,14 +486,7 @@ pub fn padding_scheme_md5(lines: &[String]) -> String {
 
 pub fn padding0_len(lines: &[String]) -> anyhow::Result<u16> {
     let plan = parse_padding_plan(lines)?;
-    let Some(GeneratedPaddingStep::Size(size)) = plan
-        .generate_record_payload_steps(0)?
-        .into_iter()
-        .find(|step| matches!(step, GeneratedPaddingStep::Size(_)))
-    else {
-        return Ok(30);
-    };
-    Ok(size as u16)
+    plan.padding0_len()
 }
 
 pub fn encode_socksaddr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {

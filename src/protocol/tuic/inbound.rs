@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{InboundConfig, UserConfig},
-    protocol::tuic::{IDLE_POLL_INTERVAL, codec, quic_settings},
+    protocol::tuic::{codec, quic_settings},
     router::Router,
     session::{Command, Session, TargetAddr},
     tls,
@@ -31,6 +31,8 @@ use crate::{
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const CHANNEL_CAPACITY: usize = 32;
+const UDP_CHANNEL_CAPACITY: usize = 128;
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(cfg.listen).await?;
@@ -121,14 +123,14 @@ struct TuicApp {
     packet_assembler: codec::PacketAssembler,
     next_udp_cleanup: Instant,
     next_uni_stream_id: u64,
-    outbound_tx: mpsc::UnboundedSender<QuicWrite>,
-    outbound_rx: mpsc::UnboundedReceiver<QuicWrite>,
+    outbound_tx: mpsc::Sender<QuicWrite>,
+    outbound_rx: mpsc::Receiver<QuicWrite>,
     pending_writes: VecDeque<QuicWrite>,
     buffer: [u8; 16 * 1024],
 }
 
 struct StreamState {
-    client_tx: mpsc::UnboundedSender<Vec<u8>>,
+    client_tx: mpsc::Sender<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -138,7 +140,7 @@ struct PendingStream {
 }
 
 struct UdpSession {
-    tx: mpsc::UnboundedSender<UdpRequest>,
+    tx: mpsc::Sender<UdpRequest>,
     mode: UdpMode,
     last_used: Instant,
 }
@@ -176,7 +178,7 @@ enum QuicWrite {
 
 impl TuicApp {
     fn new(inbound: String, router: Arc<Router>, users: Vec<TuicUser>) -> Self {
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
         Self {
             inbound,
             router,
@@ -286,8 +288,12 @@ impl TuicApp {
         }
 
         if let Some(state) = self.streams.get(&stream_id) {
-            if !data.is_empty() {
-                let _ = state.client_tx.send(data.to_vec());
+            if !data.is_empty()
+                && let Err(err) = state.client_tx.try_send(data.to_vec())
+            {
+                return Err(
+                    anyhow::anyhow!("tuic inbound stream receive backpressure: {err}").into(),
+                );
             }
             if fin {
                 self.streams.remove(&stream_id);
@@ -302,7 +308,7 @@ impl TuicApp {
             command: Command::Connect,
             target,
         };
-        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (client_tx, client_rx) = mpsc::channel(CHANNEL_CAPACITY);
         if !fin {
             self.streams.insert(stream_id, StreamState { client_tx });
         }
@@ -358,10 +364,12 @@ impl TuicApp {
                 return Err(anyhow::anyhow!("tuic udp relay mode changed").into());
             }
             session.last_used = now;
-            let _ = session.tx.send(UdpRequest {
+            if let Err(err) = session.tx.try_send(UdpRequest {
                 target,
                 payload: packet.payload,
-            });
+            }) {
+                debug!(%err, "dropped tuic udp request due to relay backpressure");
+            }
         }
         Ok(())
     }
@@ -424,7 +432,7 @@ impl ApplicationOverQuic for TuicApp {
                         self.pending_writes.push_back(write);
                     }
                 }
-                _ = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.next_udp_cleanup)) => {}
             }
         }
         Ok(())
@@ -563,8 +571,8 @@ fn spawn_relay(
     session: Session,
     stream_id: u64,
     initial: Vec<u8>,
-    mut client_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    quic_tx: mpsc::UnboundedSender<QuicWrite>,
+    mut client_rx: mpsc::Receiver<Vec<u8>>,
+    quic_tx: mpsc::Sender<QuicWrite>,
 ) {
     tokio::spawn(async move {
         let result: anyhow::Result<()> = async {
@@ -589,11 +597,14 @@ fn spawn_relay(
                         if read == 0 {
                             break;
                         }
-                        let _ = quic_tx.send(QuicWrite::Data {
-                            stream_id,
-                            data: buf[..read].to_vec(),
-                            fin: false,
-                        });
+                        quic_tx
+                            .send(QuicWrite::Data {
+                                stream_id,
+                                data: buf[..read].to_vec(),
+                                fin: false,
+                            })
+                            .await
+                            .map_err(|_| anyhow::anyhow!("tuic connection closed"))?;
                     }
                 }
             }
@@ -604,17 +615,17 @@ fn spawn_relay(
         if let Err(err) = result {
             debug!(%err, "tuic relay failed");
         }
-        let _ = quic_tx.send(QuicWrite::Close { stream_id });
+        let _ = quic_tx.send(QuicWrite::Close { stream_id }).await;
     });
 }
 
 fn spawn_udp_session(
     assoc_id: u16,
     mode: UdpMode,
-    quic_tx: mpsc::UnboundedSender<QuicWrite>,
+    quic_tx: mpsc::Sender<QuicWrite>,
     now: Instant,
 ) -> UdpSession {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         if let Err(err) = run_udp_session(assoc_id, mode, rx, quic_tx).await {
             debug!(%err, %assoc_id, "tuic udp relay failed");
@@ -630,8 +641,8 @@ fn spawn_udp_session(
 async fn run_udp_session(
     assoc_id: u16,
     mode: UdpMode,
-    mut rx: mpsc::UnboundedReceiver<UdpRequest>,
-    quic_tx: mpsc::UnboundedSender<QuicWrite>,
+    mut rx: mpsc::Receiver<UdpRequest>,
+    quic_tx: mpsc::Sender<QuicWrite>,
 ) -> anyhow::Result<()> {
     let Some(first) = rx.recv().await else {
         return Ok(());
@@ -678,7 +689,7 @@ async fn run_udp_session(
                         data: encoded,
                     },
                 };
-                let _ = quic_tx.send(write);
+                let _ = quic_tx.send(write).await;
                 pkt_id = pkt_id.wrapping_add(1);
             }
         }
@@ -687,9 +698,16 @@ async fn run_udp_session(
 }
 
 async fn send_udp_request(socket: &UdpSocket, request: UdpRequest) -> anyhow::Result<()> {
-    socket
-        .send_to(&request.payload, request.target.to_string())
-        .await?;
+    match request.target {
+        TargetAddr::Ip(addr) => {
+            socket.send_to(&request.payload, addr).await?;
+        }
+        TargetAddr::Domain { host, port } => {
+            socket
+                .send_to(&request.payload, (host.as_str(), port))
+                .await?;
+        }
+    }
     Ok(())
 }
 
