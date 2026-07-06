@@ -55,7 +55,10 @@ const CHROME_H2_ALPS_SETTINGS: &[u8] = &[
     0x00, 0x06, 0x00, 0x04, 0x00, 0x00, // MAX_HEADER_LIST_SIZE = 262144
 ];
 
-pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
+pub fn chrome_like_connector(
+    insecure: bool,
+    ca_certificate: Option<&str>,
+) -> anyhow::Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -69,6 +72,11 @@ pub fn chrome_like_connector(insecure: bool) -> anyhow::Result<SslConnector> {
     builder.enable_signed_cert_timestamps();
     builder.add_certificate_compression_algorithm(BrotliCertificateDecompressor)?;
     builder.set_options(SslOptions::NO_COMPRESSION);
+    if let Some(ca_certificate) = ca_certificate {
+        builder
+            .set_ca_file(ca_certificate)
+            .with_context(|| format!("failed to load TLS CA certificate {ca_certificate}"))?;
+    }
     if insecure {
         builder.set_verify(SslVerifyMode::NONE);
     }
@@ -93,14 +101,18 @@ pub fn configure_chrome_like_ssl(ssl: &mut SslRef) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn chrome_quic_client_hooks() -> Hooks {
+pub fn chrome_quic_client_hooks(ca_certificate: Option<&str>) -> Hooks {
     Hooks {
-        connection_hook: Some(Arc::new(ChromeQuicClientHook)),
+        connection_hook: Some(Arc::new(ChromeQuicClientHook {
+            ca_certificate: ca_certificate.map(str::to_owned),
+        })),
         ..Hooks::default()
     }
 }
 
-pub fn chrome_like_quic_client_context() -> anyhow::Result<SslContextBuilder> {
+pub fn chrome_like_quic_client_context(
+    ca_certificate: Option<&str>,
+) -> anyhow::Result<SslContextBuilder> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -109,7 +121,13 @@ pub fn chrome_like_quic_client_context() -> anyhow::Result<SslContextBuilder> {
     builder.set_grease_enabled(true);
     builder.set_permute_extensions(true);
     builder.add_certificate_compression_algorithm(BrotliCertificateDecompressor)?;
-    builder.set_default_verify_paths()?;
+    if let Some(ca_certificate) = ca_certificate {
+        builder
+            .set_ca_file(ca_certificate)
+            .with_context(|| format!("failed to load QUIC TLS CA certificate {ca_certificate}"))?;
+    } else {
+        builder.set_default_verify_paths()?;
+    }
     builder.set_options(SslOptions::NO_COMPRESSION);
     Ok(builder)
 }
@@ -163,7 +181,9 @@ struct ReloadingCertificateHook {
 }
 
 #[derive(Debug)]
-struct ChromeQuicClientHook;
+struct ChromeQuicClientHook {
+    ca_certificate: Option<String>,
+}
 
 impl ConnectionHook for ChromeQuicClientHook {
     fn create_custom_ssl_context_builder(
@@ -174,7 +194,7 @@ impl ConnectionHook for ChromeQuicClientHook {
     }
 
     fn create_custom_client_ssl_context_builder(&self) -> Option<SslContextBuilder> {
-        match chrome_like_quic_client_context() {
+        match chrome_like_quic_client_context(self.ca_certificate.as_deref()) {
             Ok(builder) => Some(builder),
             Err(err) => {
                 debug!(%err, "failed to create Chrome-like QUIC TLS context");
@@ -284,7 +304,7 @@ mod tests {
 
     #[test]
     fn chrome_like_connector_accepts_modern_chrome_groups() -> anyhow::Result<()> {
-        let connector = chrome_like_connector(true)?;
+        let connector = chrome_like_connector(false, None)?;
         let mut ssl = connector.configure()?.into_ssl("example.com")?;
         configure_chrome_like_ssl(&mut ssl)?;
         Ok(())
@@ -292,7 +312,7 @@ mod tests {
 
     #[test]
     fn chrome_like_quic_client_context_accepts_modern_chrome_groups() -> anyhow::Result<()> {
-        chrome_like_quic_client_context()?;
+        chrome_like_quic_client_context(None)?;
         Ok(())
     }
 }

@@ -71,6 +71,7 @@ pub struct OutboundConfig {
     pub server_name: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    pub ca_certificate: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub uuid: Option<String>,
@@ -315,6 +316,7 @@ default = "direct"
                 server: None,
                 server_name: None,
                 insecure: false,
+                ca_certificate: None,
                 username: None,
                 password: None,
                 uuid: None,

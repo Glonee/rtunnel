@@ -104,7 +104,7 @@ async function runCase(testCase, tmpDir, cert, tcpEcho, udpEcho) {
   try {
     if (testCase.direction === "rtunnel-out-to-sing-box-in") {
       const singConfig = singBoxServerConfig(testCase.protocol, serverPort, cert);
-      const rtunnelConfig = rtunnelClientConfig(testCase.protocol, socksPort, serverPort);
+      const rtunnelConfig = rtunnelClientConfig(testCase.protocol, socksPort, serverPort, cert);
       const singPath = writeJson(caseDir, "sing-box-server.json", singConfig);
       const rtunnelPath = writeText(caseDir, "rtunnel-client.toml", rtunnelConfig);
       const sing = spawnLogged("sing-box-server", SING_BOX_BIN, ["run", "-c", singPath], caseDir);
@@ -119,6 +119,7 @@ async function runCase(testCase, tmpDir, cert, tcpEcho, udpEcho) {
         testCase.protocol,
         socksPort,
         serverPort,
+        cert,
         testCase.singBoxUdpRelayMode,
       );
       const rtunnelPath = writeText(caseDir, "rtunnel-server.toml", rtunnelConfig);
@@ -188,7 +189,7 @@ function singBoxServerConfig(protocol, port, cert) {
   };
 }
 
-function singBoxClientConfig(protocol, socksPort, serverPort, udpRelayMode = "native") {
+function singBoxClientConfig(protocol, socksPort, serverPort, cert, udpRelayMode = "native") {
   const outbound = {
     socks5: {
       type: "socks",
@@ -206,7 +207,7 @@ function singBoxClientConfig(protocol, socksPort, serverPort, udpRelayMode = "na
       tls: {
         enabled: true,
         server_name: "localhost",
-        insecure: true,
+        certificate_path: cert.caPath,
       },
     },
     tuic: {
@@ -222,7 +223,7 @@ function singBoxClientConfig(protocol, socksPort, serverPort, udpRelayMode = "na
       tls: {
         enabled: true,
         server_name: "localhost",
-        insecure: true,
+        certificate_path: cert.caPath,
         alpn: ["h3"],
       },
     },
@@ -243,13 +244,13 @@ function singBoxClientConfig(protocol, socksPort, serverPort, udpRelayMode = "na
   };
 }
 
-function rtunnelClientConfig(protocol, socksPort, serverPort) {
+function rtunnelClientConfig(protocol, socksPort, serverPort, cert) {
   const protocolName = protocol === "socks5" ? "socks5" : protocol;
   const extra =
     protocol === "anytls"
-      ? `password = "${PASSWORD}"\nserver_name = "localhost"\ninsecure = true\n`
+      ? `password = "${PASSWORD}"\nserver_name = "localhost"\nca_certificate = "${cert.caPath}"\n`
       : protocol === "tuic"
-        ? `uuid = "${TUIC_UUID}"\npassword = "${PASSWORD}"\nserver_name = "localhost"\ninsecure = true\n`
+        ? `uuid = "${TUIC_UUID}"\npassword = "${PASSWORD}"\nserver_name = "localhost"\nca_certificate = "${cert.caPath}"\n`
         : "";
   return `log_level = "debug"
 
@@ -696,9 +697,14 @@ function ensureAlive(proc) {
 
 function createCertificate(tmpDir) {
   const certPath = path.join(tmpDir, "cert.pem");
+  const leafPath = path.join(tmpDir, "leaf.pem");
   const keyPath = path.join(tmpDir, "key.pem");
-  const result = spawnSync(
-    "openssl",
+  const caPath = path.join(tmpDir, "ca.pem");
+  const caKeyPath = path.join(tmpDir, "ca.key");
+  const csrPath = path.join(tmpDir, "leaf.csr");
+  const extPath = path.join(tmpDir, "leaf.ext");
+
+  runOpenSsl(
     [
       "req",
       "-x509",
@@ -708,18 +714,80 @@ function createCertificate(tmpDir) {
       "-days",
       "1",
       "-subj",
+      "/CN=rtunnel interop test CA",
+      "-addext",
+      "basicConstraints=critical,CA:TRUE",
+      "-addext",
+      "keyUsage=critical,keyCertSign,cRLSign",
+      "-keyout",
+      caKeyPath,
+      "-out",
+      caPath,
+    ],
+    "create CA certificate",
+  );
+
+  runOpenSsl(
+    [
+      "req",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-subj",
       "/CN=localhost",
       "-keyout",
       keyPath,
       "-out",
-      certPath,
+      csrPath,
     ],
-    { encoding: "utf8" },
+    "create localhost certificate signing request",
   );
+
+  fs.writeFileSync(
+    extPath,
+    [
+      "basicConstraints=critical,CA:FALSE",
+      "keyUsage=critical,digitalSignature,keyEncipherment",
+      "extendedKeyUsage=serverAuth",
+      "subjectAltName=DNS:localhost,IP:127.0.0.1",
+      "",
+    ].join("\n"),
+  );
+
+  runOpenSsl(
+    [
+      "x509",
+      "-req",
+      "-in",
+      csrPath,
+      "-CA",
+      caPath,
+      "-CAkey",
+      caKeyPath,
+      "-CAcreateserial",
+      "-out",
+      leafPath,
+      "-days",
+      "1",
+      "-sha256",
+      "-extfile",
+      extPath,
+    ],
+    "sign localhost certificate",
+  );
+
+  fs.writeFileSync(
+    certPath,
+    `${fs.readFileSync(leafPath, "utf8")}${fs.readFileSync(caPath, "utf8")}`,
+  );
+  return { certPath, keyPath, caPath };
+}
+
+function runOpenSsl(args, description) {
+  const result = spawnSync("openssl", args, { encoding: "utf8" });
   if (result.status !== 0) {
-    throw new Error(`openssl failed: ${result.stderr || result.stdout}`);
+    throw new Error(`openssl failed to ${description}: ${result.stderr || result.stdout}`);
   }
-  return { certPath, keyPath };
 }
 
 function writeJson(dir, name, value) {

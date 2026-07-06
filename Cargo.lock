@@ -2657,6 +2657,7 @@ dependencies = [
  "hyper 0.14.32",
  "instant-acme",
  "md5 0.7.0",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",

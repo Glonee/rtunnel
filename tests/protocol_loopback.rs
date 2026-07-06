@@ -5,6 +5,10 @@ use std::{
     time::Duration,
 };
 
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
+};
 use rtunnel::{
     config::{
         Config, InboundConfig, OutboundConfig, Protocol, RoutingConfig, TlsServerConfig, UserConfig,
@@ -29,7 +33,7 @@ use tokio_quiche::{
     ApplicationOverQuic, QuicResult,
     quic::{HandshakeInfo, QuicheConnection, connect_with_config},
     quiche,
-    settings::{ConnectionParams, Hooks, QuicSettings},
+    settings::{ConnectionParams, QuicSettings},
     socket::Socket,
 };
 use uuid::Uuid;
@@ -47,6 +51,7 @@ async fn socks5_outbound_reaches_socks5_inbound() -> anyhow::Result<()> {
         server: Some(inbound_addr),
         server_name: None,
         insecure: false,
+        ca_certificate: None,
         username: None,
         password: None,
         uuid: None,
@@ -65,6 +70,7 @@ async fn socks5_outbound_authenticates_to_socks5_inbound() -> anyhow::Result<()>
         server: Some(inbound_addr),
         server_name: None,
         insecure: false,
+        ca_certificate: None,
         username: Some("user".to_owned()),
         password: Some("pass".to_owned()),
         uuid: None,
@@ -83,6 +89,7 @@ async fn socks5_udp_reaches_socks5_inbound() -> anyhow::Result<()> {
         server: Some(inbound_addr),
         server_name: None,
         insecure: false,
+        ca_certificate: None,
         username: None,
         password: None,
         uuid: None,
@@ -94,13 +101,14 @@ async fn socks5_udp_reaches_socks5_inbound() -> anyhow::Result<()> {
 #[tokio::test]
 async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_echo_server().await?;
-    let inbound_addr = spawn_anytls_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
         server: Some(inbound_addr),
         server_name: Some("localhost".to_owned()),
-        insecure: true,
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
@@ -112,13 +120,14 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
 #[tokio::test]
 async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
-    let inbound_addr = spawn_anytls_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
         server: Some(inbound_addr),
         server_name: Some("localhost".to_owned()),
-        insecure: true,
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
@@ -129,8 +138,8 @@ async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn anytls_inbound_requires_settings_before_stream() -> anyhow::Result<()> {
-    let inbound_addr = spawn_anytls_inbound().await?;
-    let mut stream = connect_anytls_session(inbound_addr).await?;
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
+    let mut stream = connect_anytls_session(inbound_addr, &ca_certificate).await?;
 
     anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, &[]).await?;
     let alert = timeout(
@@ -151,8 +160,8 @@ async fn anytls_inbound_sends_padding_scheme_update() -> anyhow::Result<()> {
         "0=12-12".to_owned(),
         "1=64-64".to_owned(),
     ];
-    let inbound_addr = spawn_anytls_inbound_with_padding(scheme.clone()).await?;
-    let mut stream = connect_anytls_session(inbound_addr).await?;
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound_with_padding(scheme.clone()).await?;
+    let mut stream = connect_anytls_session(inbound_addr, &ca_certificate).await?;
 
     anytls_codec::write_frame(
         &mut stream,
@@ -182,13 +191,14 @@ async fn anytls_inbound_sends_padding_scheme_update() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Result<()> {
-    let (server, mut opened_streams) = spawn_anytls_reuse_probe_server().await?;
+    let (server, ca_certificate, mut opened_streams) = spawn_anytls_reuse_probe_server().await?;
     let client = AnytlsOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Anytls,
         server: Some(server),
         server_name: Some("localhost".to_owned()),
-        insecure: true,
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
@@ -227,13 +237,14 @@ async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Re
 #[tokio::test]
 async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_echo_server().await?;
-    let inbound_addr = spawn_tuic_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_tuic_inbound().await?;
     let client = TuicOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Tuic,
         server: Some(inbound_addr),
         server_name: Some("localhost".to_owned()),
-        insecure: true,
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
         username: None,
         password: Some("secret".to_owned()),
         uuid: Some(TUIC_UUID.to_owned()),
@@ -245,13 +256,14 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tuic_udp_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
-    let inbound_addr = spawn_tuic_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_tuic_inbound().await?;
     let client = TuicOutbound::new(OutboundConfig {
         tag: "client".to_owned(),
         protocol: Protocol::Tuic,
         server: Some(inbound_addr),
         server_name: Some("localhost".to_owned()),
-        insecure: true,
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
         username: None,
         password: Some("secret".to_owned()),
         uuid: Some(TUIC_UUID.to_owned()),
@@ -263,9 +275,15 @@ async fn tuic_udp_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tuic_native_udp_reaches_udp_echo() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
-    let inbound_addr = spawn_tuic_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_tuic_inbound().await?;
 
-    let received = tuic_udp_roundtrip(inbound_addr, echo_addr, TuicTestUdpMode::Native).await?;
+    let received = tuic_udp_roundtrip(
+        inbound_addr,
+        echo_addr,
+        &ca_certificate,
+        TuicTestUdpMode::Native,
+    )
+    .await?;
 
     assert_eq!(received, b"ping");
     Ok(())
@@ -274,9 +292,15 @@ async fn tuic_native_udp_reaches_udp_echo() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tuic_quic_udp_reaches_udp_echo() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
-    let inbound_addr = spawn_tuic_inbound().await?;
+    let (inbound_addr, ca_certificate) = spawn_tuic_inbound().await?;
 
-    let received = tuic_udp_roundtrip(inbound_addr, echo_addr, TuicTestUdpMode::Quic).await?;
+    let received = tuic_udp_roundtrip(
+        inbound_addr,
+        echo_addr,
+        &ca_certificate,
+        TuicTestUdpMode::Quic,
+    )
+    .await?;
 
     assert_eq!(received, b"ping");
     Ok(())
@@ -351,6 +375,7 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
             server: None,
             server_name: None,
             insecure: false,
+            ca_certificate: None,
             username: None,
             password: None,
             uuid: None,
@@ -364,16 +389,17 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
     Ok(addr)
 }
 
-async fn spawn_anytls_inbound() -> anyhow::Result<SocketAddr> {
+async fn spawn_anytls_inbound() -> anyhow::Result<(SocketAddr, String)> {
     spawn_anytls_inbound_with_padding(Vec::new()).await
 }
 
 async fn spawn_anytls_inbound_with_padding(
     padding_scheme: Vec<String>,
-) -> anyhow::Result<SocketAddr> {
+) -> anyhow::Result<(SocketAddr, String)> {
     let listener = TcpListener::bind(localhost(0)).await?;
     let addr = listener.local_addr()?;
     let tls = write_test_tls_files()?;
+    let ca_certificate = tls.ca_certificate.clone();
     let inbound_cfg = InboundConfig {
         tag: "anytls-in".to_owned(),
         listen: addr,
@@ -384,7 +410,7 @@ async fn spawn_anytls_inbound_with_padding(
             password: "secret".to_owned(),
         }]),
         padding_scheme,
-        tls: Some(tls),
+        tls: Some(tls.server),
     };
     let router = Arc::new(Router::new(Config {
         log_level: None,
@@ -396,6 +422,7 @@ async fn spawn_anytls_inbound_with_padding(
             server: None,
             server_name: None,
             insecure: false,
+            ca_certificate: None,
             username: None,
             password: None,
             uuid: None,
@@ -406,12 +433,15 @@ async fn spawn_anytls_inbound_with_padding(
         },
     })?);
     tokio::spawn(anytls_inbound::serve(listener, inbound_cfg, router));
-    Ok(addr)
+    Ok((addr, ca_certificate))
 }
 
-async fn connect_anytls_session(server: SocketAddr) -> anyhow::Result<SslStream<TcpStream>> {
+async fn connect_anytls_session(
+    server: SocketAddr,
+    ca_certificate: &str,
+) -> anyhow::Result<SslStream<TcpStream>> {
     let tcp = TcpStream::connect(server).await?;
-    let connector = tls::chrome_like_connector(true)?;
+    let connector = tls::chrome_like_connector(false, Some(ca_certificate))?;
     let mut ssl = connector.configure()?.into_ssl("localhost")?;
     tls::configure_chrome_like_ssl(&mut ssl)?;
     let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
@@ -420,11 +450,12 @@ async fn connect_anytls_session(server: SocketAddr) -> anyhow::Result<SslStream<
 }
 
 async fn spawn_anytls_reuse_probe_server()
--> anyhow::Result<(SocketAddr, mpsc::UnboundedReceiver<u32>)> {
+-> anyhow::Result<(SocketAddr, String, mpsc::UnboundedReceiver<u32>)> {
     let listener = TcpListener::bind(localhost(0)).await?;
     let addr = listener.local_addr()?;
     let tls_cfg = write_test_tls_files()?;
-    let acceptor = Arc::new(tls::server_acceptor(&tls_cfg)?);
+    let ca_certificate = tls_cfg.ca_certificate.clone();
+    let acceptor = Arc::new(tls::server_acceptor(&tls_cfg.server)?);
     let (opened_tx, opened_rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
@@ -490,13 +521,14 @@ async fn spawn_anytls_reuse_probe_server()
         }
     });
 
-    Ok((addr, opened_rx))
+    Ok((addr, ca_certificate, opened_rx))
 }
 
-async fn spawn_tuic_inbound() -> anyhow::Result<SocketAddr> {
+async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
     let socket = UdpSocket::bind(localhost(0)).await?;
     let addr = socket.local_addr()?;
     let tls = write_test_tls_files()?;
+    let ca_certificate = tls.ca_certificate.clone();
     let inbound_cfg = InboundConfig {
         tag: "tuic-in".to_owned(),
         listen: addr,
@@ -507,7 +539,7 @@ async fn spawn_tuic_inbound() -> anyhow::Result<SocketAddr> {
             password: "secret".to_owned(),
         }]),
         padding_scheme: Vec::new(),
-        tls: Some(tls),
+        tls: Some(tls.server),
     };
     let router = Arc::new(Router::new(Config {
         log_level: None,
@@ -519,6 +551,7 @@ async fn spawn_tuic_inbound() -> anyhow::Result<SocketAddr> {
             server: None,
             server_name: None,
             insecure: false,
+            ca_certificate: None,
             username: None,
             password: None,
             uuid: None,
@@ -529,7 +562,7 @@ async fn spawn_tuic_inbound() -> anyhow::Result<SocketAddr> {
         },
     })?);
     tokio::spawn(tuic_inbound::serve(socket, inbound_cfg, router));
-    Ok(addr)
+    Ok((addr, ca_certificate))
 }
 
 async fn spawn_echo_server() -> anyhow::Result<SocketAddr> {
@@ -578,6 +611,7 @@ async fn spawn_udp_echo_server() -> anyhow::Result<SocketAddr> {
 async fn tuic_udp_roundtrip(
     server: SocketAddr,
     target: SocketAddr,
+    ca_certificate: &str,
     mode: TuicTestUdpMode,
 ) -> anyhow::Result<Vec<u8>> {
     let socket = UdpSocket::bind(localhost(0)).await?;
@@ -586,8 +620,12 @@ async fn tuic_udp_roundtrip(
 
     let mut settings = QuicSettings::default();
     settings.alpn = vec![b"h3".to_vec()];
-    settings.verify_peer = false;
-    let params = ConnectionParams::new_client(settings, None, Hooks::default());
+    settings.verify_peer = true;
+    let params = ConnectionParams::new_client(
+        settings,
+        None,
+        tls::chrome_quic_client_hooks(Some(ca_certificate)),
+    );
 
     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
     let app = TuicUdpClientApp::new(TargetAddr::Ip(target), mode, response_tx);
@@ -781,7 +819,12 @@ fn localhost(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
-fn write_test_tls_files() -> anyhow::Result<TlsServerConfig> {
+struct TestTlsFiles {
+    server: TlsServerConfig,
+    ca_certificate: String,
+}
+
+fn write_test_tls_files() -> anyhow::Result<TestTlsFiles> {
     let suffix = format!(
         "{}-{}",
         std::process::id(),
@@ -791,62 +834,51 @@ fn write_test_tls_files() -> anyhow::Result<TlsServerConfig> {
     );
     let cert = std::env::temp_dir().join(format!("rtunnel-{suffix}.crt"));
     let key = std::env::temp_dir().join(format!("rtunnel-{suffix}.key"));
-    std::fs::write(&cert, CERT_PEM)?;
-    std::fs::write(&key, KEY_PEM)?;
-    Ok(TlsServerConfig {
-        certificate: Some(cert.to_string_lossy().into_owned()),
-        private_key: Some(key.to_string_lossy().into_owned()),
-        acme: None,
+    let ca = std::env::temp_dir().join(format!("rtunnel-{suffix}-ca.crt"));
+
+    let (ca_cert, ca_issuer) = test_ca()?;
+    let (server_cert, server_key) = test_server_cert(&ca_issuer)?;
+    std::fs::write(&cert, format!("{}{}", server_cert.pem(), ca_cert.pem()))?;
+    std::fs::write(&key, server_key.serialize_pem())?;
+    std::fs::write(&ca, ca_cert.pem())?;
+
+    Ok(TestTlsFiles {
+        server: TlsServerConfig {
+            certificate: Some(cert.to_string_lossy().into_owned()),
+            private_key: Some(key.to_string_lossy().into_owned()),
+            acme: None,
+        },
+        ca_certificate: ca.to_string_lossy().into_owned(),
     })
 }
 
-const CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUQqS9PiLlcPZXU7kaZJXk6SuB5hMwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYwMzE0MjMzN1oXDTI2MDYw
-NDE0MjMzN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAwOUHpVfBQYwA5nODiQ7kp2W5uredY3K5XHITc8OuPKnT
-iM9fUhaPL+tvOk8CAVpazTcTcpyMgJEx+qf3FLS71WfCtCZjxBqyLVjugxm4+dBt
-mF8oY2by4e9FJZ2CXz/uKSxcsYB85iuCCV2Gc4QnxXy7TwuugnmVnjFPpG4b4hs2
-XbAPwoiteVYyyEOgOYd//U72BMe82+1y1th7qR1nJ4oez/UaavxhyP/qnpo5FI3j
-6McVualQEfU3+wO6f1ctK403jI6dz4Q33u1CTLlSgVg9WHqKKKM+9ckfdMPL+zcw
-iGG7mdM2+vuMKFhij3pkAakhdAqIuQTyovsJ8/m0wwIDAQABo1MwUTAdBgNVHQ4E
-FgQUabZLaoALnqsGUwNH/TLR3lh4LH4wHwYDVR0jBBgwFoAUabZLaoALnqsGUwNH
-/TLR3lh4LH4wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAKc0d
-pbwkQ8CSEJ/7sjCSgpOD9BcTlZqKIMwooftO9EPSQvl4RcTkykj5DwQF5237+xWO
-IVkKciXixJZyANayQmN8N6WUNAJjRmlIbXylTs71SIU2ZrDjEx2Bpb7EbswZt1FN
-4cz+1c+lHdEQ4VYaog0qLwKGfx6+RZ/B5c5ftajnb6+3fZXJrQ8KPARq0Gy0Vn1E
-q/bGaIY7LpQNel+jG88NQONhZm0R/zL+0GaKs1uum6rJmFvAx2DziZxbJO60yTFN
-+XpBdINCT0jZsphnAXOHdy1UZ380Xy6wEvIiYbhzhfm8eRCArIsuNzkrEDkzWE4+
-hvHo2CFXLDYxy/AV2w==
------END CERTIFICATE-----
-"#;
+fn test_ca() -> anyhow::Result<(Certificate, Issuer<'static, KeyPair>)> {
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "rtunnel loopback test CA");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
 
-const KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDA5QelV8FBjADm
-c4OJDuSnZbm6t51jcrlcchNzw648qdOIz19SFo8v6286TwIBWlrNNxNynIyAkTH6
-p/cUtLvVZ8K0JmPEGrItWO6DGbj50G2YXyhjZvLh70UlnYJfP+4pLFyxgHzmK4IJ
-XYZzhCfFfLtPC66CeZWeMU+kbhviGzZdsA/CiK15VjLIQ6A5h3/9TvYEx7zb7XLW
-2HupHWcnih7P9Rpq/GHI/+qemjkUjePoxxW5qVAR9Tf7A7p/Vy0rjTeMjp3PhDfe
-7UJMuVKBWD1Yeooooz71yR90w8v7NzCIYbuZ0zb6+4woWGKPemQBqSF0Coi5BPKi
-+wnz+bTDAgMBAAECggEASWTbi+Xf+niyvvykx7mK9saV7J2AnR5BuRMOo7WIzjwv
-6JY+xpUe1jTWlXEKakle00Zpd+po62JTifPu50n9Ti20v6b7vtoJgYec+PUIlMTh
-bmCGlYvOTnkj7jQILwW8MJ5YhpFE9K8JQ1b6mWlnWJUlD+Z599sbOp24l+/tXBIk
-21vqnQcmOY1c3nT5ZJNEljeRotrlUTDQMxHtpqurYwfMUke+TLQRuQrfhI375Vef
-hw6vo7blyrn6G0oibDgppIOz/bNXR4jCyPEPIVG6GUND/fvFzvuyygaJ9jmGjrCd
-qZtDi1d38JoK31OALHi6L4R74NmgUjM34FAU08ejwQKBgQDyG5atGTp0ThNy8KB4
-Yhc3UTVyhO+DbHJHveNPOT1eDibBbbTadpwV+3FG7hwSs0e5AHdnS+XE6J4LEZaL
-lQwYlrdNM+RAwLZa+IOuk7NwqroL0qqDjxlyvlZUzFjf28jg9o64x8vX1BjSfoTw
-8I/4ymdqy9y+bGdxRmoGxd1t5QKBgQDL9ogJITKYGrc57klOgk3G+S1kBMRY2XLG
-29S5h9f3NUechUdjorbgpxKy+LX+bjbsa33aGPA0/Xw/qmOY9lcC4BgbciH55agP
-JXLwbGL7mLgCshVOBlhrU4X4G/Bqw/I/3CSDc2JBlZOuJq4+dDLfGV/8FZobpq0B
-seZ1Dh2thwKBgQCvMNV8VlgdFu4t6v9DfT9tcN8rChTC1fNwBHD6v+GvMLBMoZUP
-zGov4e3bNKutwHsy3KqKXbpbHTRXsBdu06CYHl9vhxAw5wJNm6y14/0hlvjfW0a1
-whPZGvAflmrtOf4HA4LNJQ5VFA4OKy0JqBmWHuhsuC34wTqtFhXc5srPHQKBgDhZ
-YffzvgCb0OcmWAZipY5FJS8uyfgqCzW5Yinnx9i6VZB+mdyDBbdHMTlU0SL73Byx
-DdIFdceOCJemQWHvHNbkhoR+obhipG2a0QhvSWFtLdlAzfYCdscgCjEjtuYoQHM4
-JLZUWF76LhS9BwKmI6/TWNtSNINTJxUCy0KnpbddAoGABpz3EntHgUDjGpmTBKhM
-SvXKDN3Yktjym/lB9KXa8lPEZ8v+rs/7o0mASQQe3XCRGxdwuy79Azmysb3pLvq0
-sVqd3Ijla7kui3ep7NWl9XySI2774hEYvf0HUOXIfLhe/dP/nWQFHC96OZ1ygRCe
-IXcqeU9YRAPLNOHOZVD1yV0=
------END PRIVATE KEY-----
-"#;
+    let key = KeyPair::generate()?;
+    let cert = params.self_signed(&key)?;
+    Ok((cert, Issuer::new(params, key)))
+}
+
+fn test_server_cert(issuer: &Issuer<'static, KeyPair>) -> anyhow::Result<(Certificate, KeyPair)> {
+    let mut params = CertificateParams::new(vec!["localhost".to_owned()])?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    params.use_authority_key_identifier_extension = true;
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+
+    let key = KeyPair::generate()?;
+    let cert = params.signed_by(&key, issuer)?;
+    Ok((cert, key))
+}
