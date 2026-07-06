@@ -2,9 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
+use mimalloc::MiMalloc;
 use rtunnel::{acme::AcmeManager, config::Config, protocol, router::Router};
 use tokio::signal;
 use tracing::info;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(

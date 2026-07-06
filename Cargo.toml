@@ -18,6 +18,7 @@ hex = "0.4.3"
 hyper014 = { package = "hyper", version = "0.14", features = ["http1", "server", "tcp"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
 md5 = "0.7.0"
+mimalloc = "0.1.52"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
