@@ -26,6 +26,7 @@ use crate::{
 
 const UDP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UDP_STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+const UDP_CHANNEL_CAPACITY: usize = 128;
 
 pub struct AnytlsOutbound {
     cfg: OutboundConfig,
@@ -33,10 +34,27 @@ pub struct AnytlsOutbound {
     session: Arc<Mutex<Option<Arc<ClientSession>>>>,
 }
 
-#[derive(Default)]
 struct ClientState {
-    padding_scheme: Vec<String>,
-    padding_md5: Option<String>,
+    padding_md5: String,
+    padding0_len: u16,
+    padding_plan: Arc<codec::PaddingPlan>,
+}
+
+impl ClientState {
+    fn new() -> anyhow::Result<Self> {
+        Self::from_padding_scheme(&[])
+    }
+
+    fn from_padding_scheme(lines: &[String]) -> anyhow::Result<Self> {
+        let padding_plan = codec::parse_padding_plan(lines)?;
+        let padding_md5 = padding_plan.md5().to_owned();
+        let padding0_len = padding_plan.padding0_len()?;
+        Ok(Self {
+            padding_md5,
+            padding0_len,
+            padding_plan: Arc::new(padding_plan),
+        })
+    }
 }
 
 impl AnytlsOutbound {
@@ -44,7 +62,7 @@ impl AnytlsOutbound {
         cfg.require_server()?;
         Ok(Self {
             cfg,
-            state: Arc::new(Mutex::new(ClientState::default())),
+            state: Arc::new(Mutex::new(ClientState::new()?)),
             session: Arc::new(Mutex::new(None)),
         })
     }
@@ -88,13 +106,7 @@ impl AnytlsOutbound {
             .context("anytls outbound requires password")?;
         let (padding_md5, padding0_len) = {
             let state = self.state.lock().await;
-            (
-                state
-                    .padding_md5
-                    .clone()
-                    .unwrap_or_else(|| codec::DEFAULT_PADDING_MD5.to_owned()),
-                codec::padding0_len(&state.padding_scheme)?,
-            )
+            (state.padding_md5.clone(), state.padding0_len)
         };
 
         codec::write_client_hello_with_padding(&mut stream, password, padding0_len).await?;
@@ -191,7 +203,7 @@ impl Outbound for AnytlsOutbound {
             matches!(session.command, Command::UdpAssociate),
             "anytls udp outbound only supports UDP associate"
         );
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         spawn_udp_stream_cleaner(streams.clone());
         Ok(Arc::new(AnytlsUdpSession {
@@ -258,7 +270,7 @@ impl ClientSession {
     async fn write_frame(&self, command: u8, stream_id: u32, data: &[u8]) -> anyhow::Result<()> {
         let plan = {
             let state = self.state.lock().await;
-            codec::parse_padding_plan(&state.padding_scheme)?
+            state.padding_plan.clone()
         };
         let mut writer = self.writer.lock().await;
         writer.write_frame(command, stream_id, data, &plan).await
@@ -298,9 +310,14 @@ impl ClientSession {
                 Ok(frame) if frame.command == codec::CMD_UPDATE_PADDING_SCHEME => {
                     if let Ok(scheme) = String::from_utf8(frame.data) {
                         let lines = scheme.lines().map(str::to_owned).collect::<Vec<_>>();
-                        let mut state = state.lock().await;
-                        state.padding_md5 = Some(codec::padding_scheme_md5(&lines));
-                        state.padding_scheme = lines;
+                        match ClientState::from_padding_scheme(&lines) {
+                            Ok(updated) => {
+                                *state.lock().await = updated;
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "invalid anytls padding scheme update");
+                            }
+                        }
                     }
                 }
                 Ok(frame) if frame.command == codec::CMD_ALERT => {
@@ -387,20 +404,17 @@ where
 struct AnytlsUdpSession {
     client: AnytlsOutbound,
     streams: Arc<Mutex<HashMap<TargetAddr, AnytlsUdpStream>>>,
-    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
-    response_rx: Mutex<mpsc::UnboundedReceiver<(TargetAddr, Vec<u8>)>>,
+    response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
+    response_rx: Mutex<mpsc::Receiver<(TargetAddr, Vec<u8>)>>,
 }
 
 struct AnytlsUdpStream {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
     last_used: Arc<StdMutex<Instant>>,
 }
 
 impl AnytlsUdpSession {
-    async fn sender_for(
-        &self,
-        target: &TargetAddr,
-    ) -> anyhow::Result<mpsc::UnboundedSender<Vec<u8>>> {
+    async fn sender_for(&self, target: &TargetAddr) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
         let now = Instant::now();
         let mut streams = self.streams.lock().await;
         evict_idle_udp_streams(&mut streams, now);
@@ -409,7 +423,7 @@ impl AnytlsUdpSession {
             return Ok(stream.tx.clone());
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
         let last_used = Arc::new(StdMutex::new(now));
         streams.insert(
             target.clone(),
@@ -439,7 +453,7 @@ impl ProxyDatagram for AnytlsUdpSession {
         let mut data = payload.to_vec();
         for retry in 0..2 {
             let tx = self.sender_for(target).await?;
-            match tx.send(data) {
+            match tx.send(data).await {
                 Ok(()) => return Ok(()),
                 Err(err) if retry == 0 => {
                     data = err.0;
@@ -467,8 +481,8 @@ impl ProxyDatagram for AnytlsUdpSession {
 fn spawn_uot_stream(
     client: AnytlsOutbound,
     target: TargetAddr,
-    mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    response_tx: mpsc::UnboundedSender<(TargetAddr, Vec<u8>)>,
+    mut payload_rx: mpsc::Receiver<Vec<u8>>,
+    response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
     last_used: Arc<StdMutex<Instant>>,
 ) {
     tokio::spawn(async move {
@@ -494,7 +508,9 @@ fn spawn_uot_stream(
                     payload = codec::read_uot_payload(&mut reader) => {
                         let payload = payload?;
                         touch_udp_activity(&last_used, Instant::now());
-                        let _ = response_tx.send((target.clone(), payload));
+                        if response_tx.send((target.clone(), payload)).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -601,8 +617,8 @@ mod tests {
     fn evicts_idle_udp_streams() {
         let now = Instant::now();
         let old = now - UDP_STREAM_IDLE_TIMEOUT - Duration::from_secs(1);
-        let (stale_tx, _stale_rx) = mpsc::unbounded_channel();
-        let (fresh_tx, _fresh_rx) = mpsc::unbounded_channel();
+        let (stale_tx, _stale_rx) = mpsc::channel(1);
+        let (fresh_tx, _fresh_rx) = mpsc::channel(1);
         let stale = TargetAddr::Domain {
             host: "old.example".to_owned(),
             port: 443,

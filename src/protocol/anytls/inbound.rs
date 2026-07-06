@@ -22,6 +22,7 @@ use crate::{
 };
 
 type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
+const UOT_CHANNEL_CAPACITY: usize = 128;
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -121,7 +122,7 @@ pub async fn serve(
                                         stream.write_all(&frame.data).await?;
                                     }
                                     InboundStream::Udp(tx) => {
-                                        let _ = tx.send(frame.data);
+                                        let _ = tx.send(frame.data).await;
                                     }
                                 }
                                 continue;
@@ -129,9 +130,9 @@ pub async fn serve(
 
                             let (target, consumed) = codec::decode_socksaddr(&frame.data)?;
                             if codec::is_uot_v2_magic_target(&target) {
-                                let (tx, rx) = mpsc::unbounded_channel();
+                                let (tx, rx) = mpsc::channel(UOT_CHANNEL_CAPACITY);
                                 if consumed < frame.data.len() {
-                                    let _ = tx.send(frame.data[consumed..].to_vec());
+                                    let _ = tx.send(frame.data[consumed..].to_vec()).await;
                                 }
                                 streams.insert(frame.stream_id, InboundStream::Udp(tx));
                                 if client_v2 && synacked_streams.insert(frame.stream_id) {
@@ -209,7 +210,7 @@ where
 
 enum InboundStream {
     Tcp(WriteHalf<BoxStream>),
-    Udp(mpsc::UnboundedSender<Vec<u8>>),
+    Udp(mpsc::Sender<Vec<u8>>),
 }
 
 fn spawn_outbound_reader(
@@ -245,7 +246,7 @@ fn spawn_outbound_reader(
 fn spawn_uot_reader(
     stream_id: u32,
     inbound: String,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     router: Arc<Router>,
     writer: Arc<Mutex<TlsWriteHalf>>,
 ) {
@@ -261,7 +262,7 @@ fn spawn_uot_reader(
 async fn run_uot_stream(
     stream_id: u32,
     inbound: String,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     router: Arc<Router>,
     writer: Arc<Mutex<TlsWriteHalf>>,
 ) -> anyhow::Result<()> {
@@ -325,15 +326,19 @@ async fn run_uot_packet_stream(
 }
 
 struct ChunkReader {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    buffer: VecDeque<u8>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    chunks: VecDeque<Vec<u8>>,
+    front_offset: usize,
+    buffered: usize,
 }
 
 impl ChunkReader {
-    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
         Self {
             rx,
-            buffer: VecDeque::new(),
+            chunks: VecDeque::new(),
+            front_offset: 0,
+            buffered: 0,
         }
     }
 
@@ -426,14 +431,36 @@ impl ChunkReader {
     }
 
     async fn read_exact(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
-        while self.buffer.len() < len {
+        while self.buffered < len {
             let chunk = self
                 .rx
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("uot stream closed"))?;
-            self.buffer.extend(chunk);
+            self.buffered += chunk.len();
+            if !chunk.is_empty() {
+                self.chunks.push_back(chunk);
+            }
         }
-        Ok(self.buffer.drain(..len).collect())
+
+        let mut output = Vec::with_capacity(len);
+        let mut remaining = len;
+        while remaining > 0 {
+            let Some(front) = self.chunks.front() else {
+                break;
+            };
+            let available = front.len() - self.front_offset;
+            let take = remaining.min(available);
+            output.extend_from_slice(&front[self.front_offset..self.front_offset + take]);
+            self.front_offset += take;
+            self.buffered -= take;
+            remaining -= take;
+
+            if self.front_offset == front.len() {
+                self.chunks.pop_front();
+                self.front_offset = 0;
+            }
+        }
+        Ok(output)
     }
 }
