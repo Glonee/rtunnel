@@ -12,6 +12,12 @@ server = "127.0.0.1:8443"
 server_name = "example.com"
 password = "change-me"
 insecure = true
+# Optional connection tuning. max_streams and max_connections are mutually exclusive.
+# max_streams defaults to 1. Set max_connections instead to pool connections by count.
+# max_streams = 1
+# max_connections = 4
+# idle_time defaults to "2m".
+# idle_time = "2m"
 
 [routing]
 default = "anytls-out"

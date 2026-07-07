@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 
@@ -31,7 +31,103 @@ const UDP_CHANNEL_CAPACITY: usize = 128;
 pub struct AnytlsOutbound {
     cfg: OutboundConfig,
     state: Arc<Mutex<ClientState>>,
-    session: Arc<Mutex<Option<Arc<ClientSession>>>>,
+    sessions: Arc<Mutex<ClientSessionPool>>,
+    tuning: ClientSessionTuning,
+}
+
+#[derive(Clone, Copy)]
+struct ClientSessionTuning {
+    max_streams: Option<usize>,
+    max_connections: Option<usize>,
+    connection_idle_timeout: Duration,
+}
+
+impl ClientSessionTuning {
+    fn from_config(cfg: &OutboundConfig) -> Self {
+        Self {
+            max_streams: cfg.anytls_max_streams(),
+            max_connections: cfg.max_connections,
+            connection_idle_timeout: cfg.anytls_connection_idle_timeout(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClientSessionPool {
+    sessions: Vec<Arc<ClientSession>>,
+}
+
+impl ClientSessionPool {
+    fn remove_closed_and_expired(
+        &mut self,
+        idle_timeout: Duration,
+        now: Instant,
+    ) -> Vec<Arc<ClientSession>> {
+        let mut expired = Vec::new();
+        self.sessions.retain(|session| {
+            if session.is_closed() {
+                return false;
+            }
+            if session.is_idle_expired(idle_timeout, now) {
+                session.close();
+                expired.push(session.clone());
+                return false;
+            }
+            true
+        });
+        expired
+    }
+
+    fn select(&self, tuning: ClientSessionTuning) -> Option<Arc<ClientSession>> {
+        if let Some(session) = self.freshest_idle() {
+            return Some(session);
+        }
+
+        if let Some(max_connections) = tuning.max_connections {
+            if self.sessions.len() < max_connections {
+                return None;
+            }
+            return self.least_busy_active(None);
+        }
+
+        if let Some(max_streams) = tuning.max_streams {
+            return self.least_busy_active(Some(max_streams));
+        }
+
+        self.freshest_session()
+    }
+
+    fn freshest_idle(&self) -> Option<Arc<ClientSession>> {
+        self.sessions
+            .iter()
+            .filter(|session| session.active_stream_count() == 0)
+            .max_by_key(|session| session.last_used())
+            .cloned()
+    }
+
+    fn freshest_session(&self) -> Option<Arc<ClientSession>> {
+        self.sessions
+            .iter()
+            .max_by_key(|session| session.last_used())
+            .cloned()
+    }
+
+    fn least_busy_active(&self, max_streams: Option<usize>) -> Option<Arc<ClientSession>> {
+        self.sessions
+            .iter()
+            .filter(|session| {
+                let active = session.active_stream_count();
+                active > 0 && max_streams.map_or(true, |max| active < max)
+            })
+            .min_by(|left, right| {
+                let left_active = left.active_stream_count();
+                let right_active = right.active_stream_count();
+                left_active
+                    .cmp(&right_active)
+                    .then_with(|| right.last_used().cmp(&left.last_used()))
+            })
+            .cloned()
+    }
 }
 
 struct ClientState {
@@ -59,11 +155,16 @@ impl ClientState {
 
 impl AnytlsOutbound {
     pub fn new(cfg: OutboundConfig) -> anyhow::Result<Self> {
+        cfg.validate()?;
         cfg.require_server()?;
+        let tuning = ClientSessionTuning::from_config(&cfg);
+        let sessions = Arc::new(Mutex::new(ClientSessionPool::default()));
+        spawn_connection_cleaner(sessions.clone(), tuning.connection_idle_timeout);
         Ok(Self {
             cfg,
             state: Arc::new(Mutex::new(ClientState::new()?)),
-            session: Arc::new(Mutex::new(None)),
+            sessions,
+            tuning,
         })
     }
 
@@ -71,21 +172,42 @@ impl AnytlsOutbound {
         Self {
             cfg: self.cfg.clone(),
             state: self.state.clone(),
-            session: self.session.clone(),
+            sessions: self.sessions.clone(),
+            tuning: self.tuning,
         }
     }
 
-    async fn session(&self) -> anyhow::Result<Arc<ClientSession>> {
-        let mut slot = self.session.lock().await;
-        if let Some(session) = slot.as_ref()
-            && !session.is_closed()
-        {
-            return Ok(session.clone());
-        }
+    async fn open_stream(&self) -> anyhow::Result<(Arc<ClientSession>, u32)> {
+        loop {
+            let expired = {
+                let mut pool = self.sessions.lock().await;
+                pool.remove_closed_and_expired(self.tuning.connection_idle_timeout, Instant::now())
+            };
+            shutdown_sessions(expired);
 
-        let session = self.connect_session().await?;
-        *slot = Some(session.clone());
-        Ok(session)
+            let mut pool = self.sessions.lock().await;
+            if let Some(session) = pool.select(self.tuning) {
+                match session.reserve_stream() {
+                    Ok(stream_id) => return Ok((session, stream_id)),
+                    Err(err) if session.is_closed() => {
+                        let expired = pool.remove_closed_and_expired(
+                            self.tuning.connection_idle_timeout,
+                            Instant::now(),
+                        );
+                        drop(pool);
+                        shutdown_sessions(expired);
+                        tracing::debug!(%err, "discarded closed anytls session");
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            let session = self.connect_session().await?;
+            let stream_id = session.reserve_stream()?;
+            pool.sessions.push(session.clone());
+            return Ok((session, stream_id));
+        }
     }
 
     async fn connect_session(&self) -> anyhow::Result<Arc<ClientSession>> {
@@ -132,15 +254,14 @@ impl Outbound for AnytlsOutbound {
             matches!(session.command, Command::Connect),
             "anytls outbound only supports CONNECT"
         );
-        let session_state = self.session().await?;
-        let stream_id = session_state.next_stream_id()?;
+        let (session_state, stream_id) = self.open_stream().await?;
         let (client_side, relay_side) = tokio::io::duplex(64 * 1024);
         let (mut app_reader, mut app_writer) = tokio::io::split(relay_side);
         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(32);
 
         {
             let mut streams = session_state.streams.lock().await;
-            streams.insert(stream_id, data_tx);
+            streams.insert(stream_id, ClientStream { tx: data_tx });
         }
 
         if let Err(err) = session_state
@@ -148,7 +269,7 @@ impl Outbound for AnytlsOutbound {
             .await
         {
             session_state.close();
-            session_state.streams.lock().await.remove(&stream_id);
+            session_state.remove_stream(stream_id).await;
             return Err(err);
         }
 
@@ -185,12 +306,14 @@ impl Outbound for AnytlsOutbound {
             });
         }
 
+        let session_for_app_writer = session_state.clone();
         tokio::spawn(async move {
             while let Some(data) = data_rx.recv().await {
                 if app_writer.write_all(&data).await.is_err() {
                     break;
                 }
             }
+            session_for_app_writer.remove_stream(stream_id).await;
         });
 
         Ok(Box::new(client_side))
@@ -218,10 +341,16 @@ type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 
 struct ClientSession {
     writer: Arc<Mutex<ClientWriter<TlsWriteHalf>>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    streams: Arc<Mutex<HashMap<u32, ClientStream>>>,
     state: Arc<Mutex<ClientState>>,
     next_stream_id: AtomicU32,
+    active_streams: AtomicUsize,
+    last_used: StdMutex<Instant>,
     closed: AtomicBool,
+}
+
+struct ClientStream {
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl ClientSession {
@@ -231,6 +360,8 @@ impl ClientSession {
             streams: Arc::new(Mutex::new(HashMap::new())),
             state,
             next_stream_id: AtomicU32::new(1),
+            active_streams: AtomicUsize::new(0),
+            last_used: StdMutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         }
     }
@@ -243,10 +374,80 @@ impl ClientSession {
         self.closed.store(true, Ordering::SeqCst);
     }
 
-    fn next_stream_id(&self) -> anyhow::Result<u32> {
+    fn active_stream_count(&self) -> usize {
+        self.active_streams.load(Ordering::SeqCst)
+    }
+
+    fn last_used(&self) -> Instant {
+        self.last_used
+            .lock()
+            .map(|last_used| *last_used)
+            .unwrap_or_else(|_| Instant::now())
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last_used) = self.last_used.lock() {
+            *last_used = Instant::now();
+        }
+    }
+
+    fn is_idle_expired(&self, idle_timeout: Duration, now: Instant) -> bool {
+        self.active_stream_count() == 0
+            && now.saturating_duration_since(self.last_used()) > idle_timeout
+    }
+
+    fn reserve_stream(&self) -> anyhow::Result<u32> {
+        anyhow::ensure!(!self.is_closed(), "anytls session is closed");
         let id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
         anyhow::ensure!(id != 0, "anytls stream id overflow");
+        self.active_streams.fetch_add(1, Ordering::SeqCst);
+        self.touch();
         Ok(id)
+    }
+
+    async fn remove_stream(&self, stream_id: u32) {
+        let removed = self.streams.lock().await.remove(&stream_id).is_some();
+        if removed {
+            self.release_stream();
+        }
+    }
+
+    async fn clear_streams(&self) {
+        let cleared = {
+            let mut streams = self.streams.lock().await;
+            let cleared = streams.len();
+            streams.clear();
+            cleared
+        };
+        if cleared > 0 {
+            self.active_streams.store(0, Ordering::SeqCst);
+            self.touch();
+        }
+    }
+
+    fn release_stream(&self) {
+        let mut current = self.active_streams.load(Ordering::SeqCst);
+        while current > 0 {
+            match self.active_streams.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.touch();
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.close();
+        self.clear_streams().await;
+        let mut writer = self.writer.lock().await;
+        let _ = writer.shutdown().await;
     }
 
     async fn write_connect(
@@ -282,15 +483,21 @@ impl ClientSession {
         loop {
             match codec::read_frame(&mut tls_reader).await {
                 Ok(frame) if frame.command == codec::CMD_PSH => {
-                    let tx = { self.streams.lock().await.get(&frame.stream_id).cloned() };
+                    let tx = {
+                        self.streams
+                            .lock()
+                            .await
+                            .get(&frame.stream_id)
+                            .map(|stream| stream.tx.clone())
+                    };
                     if let Some(tx) = tx
                         && tx.send(frame.data).await.is_err()
                     {
-                        self.streams.lock().await.remove(&frame.stream_id);
+                        self.remove_stream(frame.stream_id).await;
                     }
                 }
                 Ok(frame) if frame.command == codec::CMD_FIN => {
-                    self.streams.lock().await.remove(&frame.stream_id);
+                    self.remove_stream(frame.stream_id).await;
                 }
                 Ok(frame) if frame.command == codec::CMD_SYNACK && !frame.data.is_empty() => {
                     tracing::warn!(
@@ -298,7 +505,7 @@ impl ClientSession {
                         message = %String::from_utf8_lossy(&frame.data),
                         "anytls stream open failed"
                     );
-                    self.streams.lock().await.remove(&frame.stream_id);
+                    self.remove_stream(frame.stream_id).await;
                 }
                 Ok(frame) if frame.command == codec::CMD_HEART_REQUEST => {
                     let _ = self
@@ -331,7 +538,7 @@ impl ClientSession {
         }
 
         self.close();
-        self.streams.lock().await.clear();
+        self.clear_streams().await;
     }
 }
 
@@ -396,6 +603,56 @@ where
 
         self.inner.write_all(&data).await?;
         Ok(())
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.inner.shutdown().await?;
+        Ok(())
+    }
+}
+
+fn spawn_connection_cleaner(
+    sessions: Arc<Mutex<ClientSessionPool>>,
+    connection_idle_timeout: Duration,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    handle.spawn(async move {
+        let mut interval =
+            tokio::time::interval(connection_cleanup_interval(connection_idle_timeout));
+        loop {
+            interval.tick().await;
+            if Arc::strong_count(&sessions) == 1 {
+                break;
+            }
+
+            let expired = {
+                let mut pool = sessions.lock().await;
+                pool.remove_closed_and_expired(connection_idle_timeout, Instant::now())
+            };
+            shutdown_sessions(expired);
+        }
+    });
+}
+
+fn connection_cleanup_interval(connection_idle_timeout: Duration) -> Duration {
+    let half_timeout = connection_idle_timeout / 2;
+    if half_timeout < Duration::from_millis(10) {
+        Duration::from_millis(10)
+    } else if half_timeout > Duration::from_secs(30) {
+        Duration::from_secs(30)
+    } else {
+        half_timeout
+    }
+}
+
+fn shutdown_sessions(sessions: Vec<Arc<ClientSession>>) {
+    for session in sessions {
+        tokio::spawn(async move {
+            session.shutdown().await;
+        });
     }
 }
 
