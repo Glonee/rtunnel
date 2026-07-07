@@ -63,19 +63,20 @@ impl ClientSessionPool {
         idle_timeout: Duration,
         now: Instant,
     ) -> Vec<Arc<ClientSession>> {
-        let mut expired = Vec::new();
+        let mut removed = Vec::new();
         self.sessions.retain(|session| {
             if session.is_closed() {
+                removed.push(session.clone());
                 return false;
             }
             if session.is_idle_expired(idle_timeout, now) {
                 session.close();
-                expired.push(session.clone());
+                removed.push(session.clone());
                 return false;
             }
             true
         });
-        expired
+        removed
     }
 
     fn select(&self, tuning: ClientSessionTuning) -> Option<Arc<ClientSession>> {
@@ -268,8 +269,7 @@ impl Outbound for AnytlsOutbound {
             .write_connect(stream_id, &session.target)
             .await
         {
-            session_state.close();
-            session_state.remove_stream(stream_id).await;
+            session_state.shutdown().await;
             return Err(err);
         }
 
@@ -280,9 +280,13 @@ impl Outbound for AnytlsOutbound {
                 loop {
                     match app_reader.read(&mut buf).await {
                         Ok(0) => {
-                            let _ = session_state
+                            if session_state
                                 .write_frame(codec::CMD_FIN, stream_id, &[])
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                session_state.shutdown().await;
+                            }
                             break;
                         }
                         Ok(n) => {
@@ -291,14 +295,18 @@ impl Outbound for AnytlsOutbound {
                                 .await
                                 .is_err()
                             {
-                                session_state.close();
+                                session_state.shutdown().await;
                                 break;
                             }
                         }
                         Err(_) => {
-                            let _ = session_state
+                            if session_state
                                 .write_frame(codec::CMD_FIN, stream_id, &[])
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                session_state.shutdown().await;
+                            }
                             break;
                         }
                     }
