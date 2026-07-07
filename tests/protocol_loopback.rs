@@ -26,7 +26,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_boring::{SslStream, SslStreamBuilder, accept};
 use tokio_quiche::{
@@ -55,6 +55,9 @@ async fn socks5_outbound_reaches_socks5_inbound() -> anyhow::Result<()> {
         username: None,
         password: None,
         uuid: None,
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
@@ -74,6 +77,9 @@ async fn socks5_outbound_authenticates_to_socks5_inbound() -> anyhow::Result<()>
         username: Some("user".to_owned()),
         password: Some("pass".to_owned()),
         uuid: None,
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
@@ -93,6 +99,9 @@ async fn socks5_udp_reaches_socks5_inbound() -> anyhow::Result<()> {
         username: None,
         password: None,
         uuid: None,
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_udp_roundtrip(client, echo_addr).await
@@ -112,6 +121,9 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
@@ -131,6 +143,9 @@ async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_udp_roundtrip(client, echo_addr).await
@@ -202,6 +217,9 @@ async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Re
         username: None,
         password: Some("secret".to_owned()),
         uuid: None,
+        max_streams: Some(2),
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
     let session = Session {
         inbound: "test-client".to_owned(),
@@ -235,6 +253,118 @@ async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn anytls_max_streams_opens_new_connection_when_live_sessions_are_full() -> anyhow::Result<()>
+{
+    let (server, ca_certificate, mut opened_streams) =
+        spawn_anytls_pool_probe_server(false).await?;
+    let client = AnytlsOutbound::new(anytls_probe_outbound(
+        server,
+        ca_certificate,
+        Some(1),
+        None,
+        None,
+    ))?;
+    let session = anytls_probe_session();
+    let mut open_streams = Vec::new();
+
+    let first = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let first_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(first_event.connection, 1);
+    open_streams.push(first);
+
+    let second = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let second_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(second_event.connection, 2);
+    open_streams.push(second);
+
+    assert_eq!(open_streams.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_max_connections_creates_connection_when_all_existing_are_active()
+-> anyhow::Result<()> {
+    let (server, ca_certificate, mut opened_streams) =
+        spawn_anytls_pool_probe_server(false).await?;
+    let client = AnytlsOutbound::new(anytls_probe_outbound(
+        server,
+        ca_certificate,
+        None,
+        Some(2),
+        None,
+    ))?;
+    let session = anytls_probe_session();
+    let mut open_streams = Vec::new();
+
+    let first = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let first_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(first_event.connection, 1);
+    open_streams.push(first);
+
+    let second = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let second_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(second_event.connection, 2);
+    open_streams.push(second);
+
+    assert_eq!(open_streams.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_max_connections_at_limit_uses_least_busy_active_connection() -> anyhow::Result<()> {
+    let (server, ca_certificate, mut opened_streams) =
+        spawn_anytls_pool_probe_server(false).await?;
+    let client = AnytlsOutbound::new(anytls_probe_outbound(
+        server,
+        ca_certificate,
+        None,
+        Some(2),
+        None,
+    ))?;
+    let session = anytls_probe_session();
+    let mut open_streams = Vec::new();
+    let mut connections = Vec::new();
+
+    for _ in 0..4 {
+        let stream = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+        let event = recv_anytls_probe_event(&mut opened_streams).await?;
+        connections.push(event.connection);
+        open_streams.push(stream);
+    }
+
+    assert_eq!(connections, vec![1, 2, 2, 1]);
+    assert_eq!(open_streams.len(), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_idle_timeout_discards_old_idle_connection() -> anyhow::Result<()> {
+    let (server, ca_certificate, mut opened_streams) = spawn_anytls_pool_probe_server(true).await?;
+    let client = AnytlsOutbound::new(anytls_probe_outbound(
+        server,
+        ca_certificate,
+        None,
+        None,
+        Some(Duration::from_millis(20)),
+    ))?;
+    let session = anytls_probe_session();
+
+    let mut first = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let first_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(first_event.connection, 1);
+    assert_anytls_probe_reply(&mut first).await?;
+
+    sleep(Duration::from_millis(80)).await;
+
+    let mut second = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let second_event = recv_anytls_probe_event(&mut opened_streams).await?;
+    assert_eq!(second_event.connection, 2);
+    assert_anytls_probe_reply(&mut second).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_echo_server().await?;
     let (inbound_addr, ca_certificate) = spawn_tuic_inbound().await?;
@@ -248,6 +378,9 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
         username: None,
         password: Some("secret".to_owned()),
         uuid: Some(TUIC_UUID.to_owned()),
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
@@ -267,6 +400,9 @@ async fn tuic_udp_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
         username: None,
         password: Some("secret".to_owned()),
         uuid: Some(TUIC_UUID.to_owned()),
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
     })?;
 
     assert_udp_roundtrip(client, echo_addr).await
@@ -379,6 +515,9 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
             username: None,
             password: None,
             uuid: None,
+            max_streams: None,
+            max_connections: None,
+            connection_idle_timeout: None,
         }],
         routing: RoutingConfig {
             default: Some("direct".to_owned()),
@@ -426,6 +565,9 @@ async fn spawn_anytls_inbound_with_padding(
             username: None,
             password: None,
             uuid: None,
+            max_streams: None,
+            max_connections: None,
+            connection_idle_timeout: None,
         }],
         routing: RoutingConfig {
             default: Some("direct".to_owned()),
@@ -447,6 +589,168 @@ async fn connect_anytls_session(
     let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
     anytls_codec::write_client_hello(&mut stream, "secret").await?;
     Ok(stream)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AnytlsProbeEvent {
+    connection: u32,
+    stream_id: u32,
+}
+
+fn anytls_probe_session() -> Session {
+    Session {
+        inbound: "test-client".to_owned(),
+        command: Command::Connect,
+        target: TargetAddr::Ip(localhost(9)),
+    }
+}
+
+fn anytls_probe_outbound(
+    server: SocketAddr,
+    ca_certificate: String,
+    max_streams: Option<usize>,
+    max_connections: Option<usize>,
+    connection_idle_timeout: Option<Duration>,
+) -> OutboundConfig {
+    OutboundConfig {
+        tag: "client".to_owned(),
+        protocol: Protocol::Anytls,
+        server: Some(server.into()),
+        server_name: Some("localhost".to_owned()),
+        insecure: false,
+        ca_certificate: Some(ca_certificate),
+        username: None,
+        password: Some("secret".to_owned()),
+        uuid: None,
+        max_streams,
+        max_connections,
+        connection_idle_timeout,
+    }
+}
+
+async fn recv_anytls_probe_event(
+    opened_streams: &mut mpsc::UnboundedReceiver<AnytlsProbeEvent>,
+) -> anyhow::Result<AnytlsProbeEvent> {
+    timeout(Duration::from_secs(5), opened_streams.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("anytls probe closed"))
+}
+
+async fn assert_anytls_probe_reply<S>(stream: &mut S) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut reply = [0; 2];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut reply)).await??;
+    assert_eq!(&reply, b"ok");
+    Ok(())
+}
+
+async fn spawn_anytls_pool_probe_server(
+    send_fin: bool,
+) -> anyhow::Result<(
+    SocketAddr,
+    String,
+    mpsc::UnboundedReceiver<AnytlsProbeEvent>,
+)> {
+    let listener = TcpListener::bind(localhost(0)).await?;
+    let addr = listener.local_addr()?;
+    let tls_cfg = write_test_tls_files()?;
+    let ca_certificate = tls_cfg.ca_certificate.clone();
+    let acceptor = Arc::new(tls::server_acceptor(&tls_cfg.server)?);
+    let (opened_tx, opened_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let mut next_connection = 1;
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let connection = next_connection;
+            next_connection += 1;
+            let acceptor = acceptor.clone();
+            let opened_tx = opened_tx.clone();
+            tokio::spawn(async move {
+                run_anytls_pool_probe_connection(stream, acceptor, connection, opened_tx, send_fin)
+                    .await;
+            });
+        }
+    });
+
+    Ok((addr, ca_certificate, opened_rx))
+}
+
+async fn run_anytls_pool_probe_connection(
+    stream: TcpStream,
+    acceptor: Arc<boring::ssl::SslAcceptor>,
+    connection: u32,
+    opened_tx: mpsc::UnboundedSender<AnytlsProbeEvent>,
+    send_fin: bool,
+) {
+    let Ok(mut stream) = accept(&acceptor, stream).await else {
+        return;
+    };
+    let users = [UserConfig {
+        username: "user".to_owned(),
+        uuid: None,
+        password: "secret".to_owned(),
+    }];
+    if anytls_codec::read_client_hello(&mut stream, &users)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        let Ok(frame) = anytls_codec::read_frame(&mut stream).await else {
+            return;
+        };
+        match frame.command {
+            anytls_codec::CMD_SETTINGS => {
+                let _ = anytls_codec::write_frame(
+                    &mut stream,
+                    anytls_codec::CMD_SERVER_SETTINGS,
+                    0,
+                    anytls_codec::settings(),
+                )
+                .await;
+            }
+            anytls_codec::CMD_SYN => {}
+            anytls_codec::CMD_PSH => {
+                if anytls_codec::decode_socksaddr(&frame.data).is_ok() {
+                    let _ = opened_tx.send(AnytlsProbeEvent {
+                        connection,
+                        stream_id: frame.stream_id,
+                    });
+                    let _ = anytls_codec::write_frame(
+                        &mut stream,
+                        anytls_codec::CMD_SYNACK,
+                        frame.stream_id,
+                        &[],
+                    )
+                    .await;
+                    let _ = anytls_codec::write_frame(
+                        &mut stream,
+                        anytls_codec::CMD_PSH,
+                        frame.stream_id,
+                        b"ok",
+                    )
+                    .await;
+                    if send_fin {
+                        let _ = anytls_codec::write_frame(
+                            &mut stream,
+                            anytls_codec::CMD_FIN,
+                            frame.stream_id,
+                            &[],
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn spawn_anytls_reuse_probe_server()
@@ -555,6 +859,9 @@ async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
             username: None,
             password: None,
             uuid: None,
+            max_streams: None,
+            max_connections: None,
+            connection_idle_timeout: None,
         }],
         routing: RoutingConfig {
             default: Some("direct".to_owned()),

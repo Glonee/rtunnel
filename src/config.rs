@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
+    time::Duration,
 };
 
 use anyhow::{Context, bail, ensure};
@@ -46,6 +47,9 @@ impl Config {
                 tls.validate(&inbound.tag)?;
             }
         }
+        for outbound in &self.outbounds {
+            outbound.validate()?;
+        }
         Ok(())
     }
 
@@ -77,9 +81,45 @@ pub struct OutboundConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub uuid: Option<String>,
+    pub max_streams: Option<usize>,
+    pub max_connections: Option<usize>,
+    #[serde(
+        default,
+        alias = "idle_time",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub connection_idle_timeout: Option<Duration>,
 }
 
 impl OutboundConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(self.protocol, Protocol::Anytls) {
+            return Ok(());
+        }
+
+        ensure!(
+            !(self.max_streams.is_some() && self.max_connections.is_some()),
+            "anytls outbound {} cannot configure both max_streams and max_connections",
+            self.tag
+        );
+        ensure!(
+            self.max_streams != Some(0),
+            "anytls outbound {} max_streams must be greater than zero",
+            self.tag
+        );
+        ensure!(
+            self.max_connections != Some(0),
+            "anytls outbound {} max_connections must be greater than zero",
+            self.tag
+        );
+        ensure!(
+            self.connection_idle_timeout != Some(Duration::ZERO),
+            "anytls outbound {} connection_idle_timeout must be greater than zero",
+            self.tag
+        );
+        Ok(())
+    }
+
     pub fn require_server(&self) -> anyhow::Result<&ServerAddr> {
         self.server
             .as_ref()
@@ -92,6 +132,77 @@ impl OutboundConfig {
             .or_else(|| self.server.as_ref().and_then(ServerAddr::domain))
             .with_context(|| format!("outbound {} requires server_name", self.tag))
     }
+
+    pub fn anytls_connection_idle_timeout(&self) -> Duration {
+        self.connection_idle_timeout
+            .unwrap_or_else(default_anytls_connection_idle_timeout)
+    }
+
+    pub fn anytls_max_streams(&self) -> Option<usize> {
+        if self.max_connections.is_some() {
+            None
+        } else {
+            Some(self.max_streams.unwrap_or_else(default_anytls_max_streams))
+        }
+    }
+}
+
+pub fn default_anytls_max_streams() -> usize {
+    1
+}
+
+pub fn default_anytls_connection_idle_timeout() -> Duration {
+    Duration::from_secs(2 * 60)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DurationValue {
+    Seconds(u64),
+    Text(String),
+}
+
+fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<DurationValue>::deserialize(deserializer)?
+        .map(parse_duration_value)
+        .transpose()
+        .map_err(de::Error::custom)
+}
+
+fn parse_duration_value(value: DurationValue) -> anyhow::Result<Duration> {
+    match value {
+        DurationValue::Seconds(seconds) => Ok(Duration::from_secs(seconds)),
+        DurationValue::Text(text) => parse_duration_text(&text),
+    }
+}
+
+fn parse_duration_text(text: &str) -> anyhow::Result<Duration> {
+    let value = text.trim();
+    ensure!(!value.is_empty(), "duration must not be empty");
+
+    let digits = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    ensure!(digits > 0, "duration {text:?} must start with a number");
+
+    let amount = value[..digits]
+        .parse::<u64>()
+        .with_context(|| format!("duration {text:?} has an invalid number"))?;
+    let unit = value[digits..].trim();
+    let seconds = match unit {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => return Ok(Duration::from_secs(amount)),
+        "m" | "min" | "mins" | "minute" | "minutes" => amount.checked_mul(60),
+        "h" | "hr" | "hrs" | "hour" | "hours" => amount.checked_mul(60 * 60),
+        "d" | "day" | "days" => amount.checked_mul(24 * 60 * 60),
+        "ms" | "millisecond" | "milliseconds" => return Ok(Duration::from_millis(amount)),
+        other => bail!("duration {text:?} has unsupported unit {other:?}"),
+    }
+    .with_context(|| format!("duration {text:?} is too large"))?;
+
+    Ok(Duration::from_secs(seconds))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -467,6 +578,112 @@ default = "proxy"
         assert!(cfg.validate().is_err());
     }
 
+    #[test]
+    fn parses_anytls_connection_tuning() {
+        let raw = r#"
+[[inbounds]]
+tag = "socks-in"
+listen = "127.0.0.1:1080"
+protocol = "socks5"
+
+[[outbounds]]
+tag = "anytls-out"
+protocol = "anytls"
+server = "proxy.example.com:443"
+server_name = "proxy.example.com"
+password = "secret"
+max_connections = 4
+idle_time = "2m"
+
+[routing]
+default = "anytls-out"
+"#;
+
+        let cfg: Config = toml::from_str(raw).unwrap();
+        cfg.validate().unwrap();
+        let outbound = &cfg.outbounds[0];
+
+        assert_eq!(outbound.max_connections, Some(4));
+        assert_eq!(outbound.max_streams, None);
+        assert_eq!(outbound.anytls_max_streams(), None);
+        assert_eq!(
+            outbound.anytls_connection_idle_timeout(),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn defaults_anytls_connection_tuning() {
+        let cfg = anytls_config(None, None, None);
+
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.outbounds[0].anytls_max_streams(),
+            Some(default_anytls_max_streams())
+        );
+        assert_eq!(
+            cfg.outbounds[0].anytls_connection_idle_timeout(),
+            default_anytls_connection_idle_timeout()
+        );
+    }
+
+    #[test]
+    fn rejects_anytls_max_streams_with_max_connections() {
+        let cfg = anytls_config(Some(4), Some(2), None);
+
+        let err = cfg.validate().unwrap_err().to_string();
+
+        assert!(err.contains("cannot configure both max_streams and max_connections"));
+    }
+
+    #[test]
+    fn rejects_zero_anytls_connection_tuning_values() {
+        let max_streams = anytls_config(Some(0), None, None);
+        let max_connections = anytls_config(None, Some(0), None);
+        let idle_timeout = anytls_config(None, None, Some(Duration::ZERO));
+
+        assert!(max_streams.validate().is_err());
+        assert!(max_connections.validate().is_err());
+        assert!(idle_timeout.validate().is_err());
+    }
+
+    fn anytls_config(
+        max_streams: Option<usize>,
+        max_connections: Option<usize>,
+        connection_idle_timeout: Option<Duration>,
+    ) -> Config {
+        Config {
+            log_level: None,
+            acme: None,
+            inbounds: vec![InboundConfig {
+                tag: "socks-in".to_owned(),
+                listen: "127.0.0.1:1080".parse().unwrap(),
+                protocol: Protocol::Socks5,
+                users: None,
+                padding_scheme: Vec::new(),
+                tls: None,
+            }],
+            outbounds: vec![OutboundConfig {
+                tag: "anytls-out".to_owned(),
+                protocol: Protocol::Anytls,
+                server: Some("proxy.example.com:443".parse().unwrap()),
+                server_name: Some("proxy.example.com".to_owned()),
+                insecure: false,
+                ca_certificate: None,
+                username: None,
+                password: Some("secret".to_owned()),
+                uuid: None,
+                max_streams,
+                max_connections,
+                connection_idle_timeout,
+            }],
+            routing: RoutingConfig {
+                default: Some("anytls-out".to_owned()),
+                rules: Vec::new(),
+            },
+        }
+    }
+
     fn config_with_tls(tls: TlsServerConfig) -> Config {
         Config {
             log_level: None,
@@ -489,6 +706,9 @@ default = "proxy"
                 username: None,
                 password: None,
                 uuid: None,
+                max_streams: None,
+                max_connections: None,
+                connection_idle_timeout: None,
             }],
             routing: RoutingConfig {
                 default: Some("direct".to_owned()),
