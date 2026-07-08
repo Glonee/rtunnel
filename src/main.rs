@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         acme.spawn_renewal_tasks();
     }
 
-    let router = Arc::new(Router::new(cfg.clone())?);
+    let router = Arc::new(Router::new(cfg.clone()).await?);
     for inbound_cfg in cfg.inbounds.clone() {
         let router = router.clone();
         tokio::spawn(async move {

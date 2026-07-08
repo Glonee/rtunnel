@@ -155,7 +155,7 @@ impl ClientState {
 }
 
 impl AnytlsOutbound {
-    pub fn new(cfg: OutboundConfig) -> anyhow::Result<Self> {
+    pub async fn new(cfg: OutboundConfig) -> anyhow::Result<Self> {
         cfg.validate()?;
         cfg.require_server()?;
         let tuning = ClientSessionTuning::from_config(&cfg);
@@ -623,11 +623,7 @@ fn spawn_connection_cleaner(
     sessions: Arc<Mutex<ClientSessionPool>>,
     connection_idle_timeout: Duration,
 ) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-
-    handle.spawn(async move {
+    tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(connection_cleanup_interval(connection_idle_timeout));
         loop {

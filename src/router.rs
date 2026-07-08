@@ -28,10 +28,10 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(cfg: Config) -> anyhow::Result<Self> {
+    pub async fn new(cfg: Config) -> anyhow::Result<Self> {
         let mut outbounds: HashMap<String, Arc<dyn Outbound>> = HashMap::new();
         for outbound in &cfg.outbounds {
-            outbounds.insert(outbound.tag.clone(), build_outbound(outbound)?);
+            outbounds.insert(outbound.tag.clone(), build_outbound(outbound).await?);
         }
         Ok(Self { cfg, outbounds })
     }
@@ -73,11 +73,11 @@ impl Router {
     }
 }
 
-fn build_outbound(cfg: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {
+async fn build_outbound(cfg: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {
     let outbound: Arc<dyn Outbound> = match cfg.protocol {
         Protocol::Direct => Arc::new(DirectOutbound),
         Protocol::Socks5 => Arc::new(Socks5Outbound::new(cfg.clone())?),
-        Protocol::Anytls => Arc::new(AnytlsOutbound::new(cfg.clone())?),
+        Protocol::Anytls => Arc::new(AnytlsOutbound::new(cfg.clone()).await?),
         Protocol::Tuic => Arc::new(TuicOutbound::new(cfg.clone())?),
     };
     if matches!(
