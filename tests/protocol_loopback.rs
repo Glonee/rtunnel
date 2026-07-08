@@ -124,7 +124,8 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
         max_streams: None,
         max_connections: None,
         connection_idle_timeout: None,
-    })?;
+    })
+    .await?;
 
     assert_echo_roundtrip(client, echo_addr).await
 }
@@ -146,7 +147,8 @@ async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
         max_streams: None,
         max_connections: None,
         connection_idle_timeout: None,
-    })?;
+    })
+    .await?;
 
     assert_udp_roundtrip(client, echo_addr).await
 }
@@ -220,7 +222,8 @@ async fn anytls_outbound_reuses_tls_session_for_multiple_streams() -> anyhow::Re
         max_streams: Some(2),
         max_connections: None,
         connection_idle_timeout: None,
-    })?;
+    })
+    .await?;
     let session = Session {
         inbound: "test-client".to_owned(),
         command: Command::Connect,
@@ -263,7 +266,8 @@ async fn anytls_max_streams_opens_new_connection_when_live_sessions_are_full() -
         Some(1),
         None,
         None,
-    ))?;
+    ))
+    .await?;
     let session = anytls_probe_session();
     let mut open_streams = Vec::new();
 
@@ -292,7 +296,8 @@ async fn anytls_max_connections_creates_connection_when_all_existing_are_active(
         None,
         Some(2),
         None,
-    ))?;
+    ))
+    .await?;
     let session = anytls_probe_session();
     let mut open_streams = Vec::new();
 
@@ -320,7 +325,8 @@ async fn anytls_max_connections_at_limit_uses_least_busy_active_connection() -> 
         None,
         Some(2),
         None,
-    ))?;
+    ))
+    .await?;
     let session = anytls_probe_session();
     let mut open_streams = Vec::new();
     let mut connections = Vec::new();
@@ -346,7 +352,8 @@ async fn anytls_idle_timeout_discards_old_idle_connection() -> anyhow::Result<()
         None,
         None,
         Some(Duration::from_millis(20)),
-    ))?;
+    ))
+    .await?;
     let session = anytls_probe_session();
 
     let mut first = timeout(Duration::from_secs(5), client.dial(&session)).await??;
@@ -501,29 +508,32 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
         padding_scheme: Vec::new(),
         tls: None,
     };
-    let router = Arc::new(Router::new(Config {
-        log_level: None,
-        acme: None,
-        inbounds: vec![inbound_cfg.clone()],
-        outbounds: vec![OutboundConfig {
-            tag: "direct".to_owned(),
-            protocol: Protocol::Direct,
-            server: None,
-            server_name: None,
-            insecure: false,
-            ca_certificate: None,
-            username: None,
-            password: None,
-            uuid: None,
-            max_streams: None,
-            max_connections: None,
-            connection_idle_timeout: None,
-        }],
-        routing: RoutingConfig {
-            default: Some("direct".to_owned()),
-            rules: Vec::new(),
-        },
-    })?);
+    let router = Arc::new(
+        Router::new(Config {
+            log_level: None,
+            acme: None,
+            inbounds: vec![inbound_cfg.clone()],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_owned(),
+                protocol: Protocol::Direct,
+                server: None,
+                server_name: None,
+                insecure: false,
+                ca_certificate: None,
+                username: None,
+                password: None,
+                uuid: None,
+                max_streams: None,
+                max_connections: None,
+                connection_idle_timeout: None,
+            }],
+            routing: RoutingConfig {
+                default: Some("direct".to_owned()),
+                rules: Vec::new(),
+            },
+        })
+        .await?,
+    );
     tokio::spawn(socks5_inbound::serve(listener, inbound_cfg, router));
     Ok(addr)
 }
@@ -551,29 +561,32 @@ async fn spawn_anytls_inbound_with_padding(
         padding_scheme,
         tls: Some(tls.server),
     };
-    let router = Arc::new(Router::new(Config {
-        log_level: None,
-        acme: None,
-        inbounds: vec![inbound_cfg.clone()],
-        outbounds: vec![OutboundConfig {
-            tag: "direct".to_owned(),
-            protocol: Protocol::Direct,
-            server: None,
-            server_name: None,
-            insecure: false,
-            ca_certificate: None,
-            username: None,
-            password: None,
-            uuid: None,
-            max_streams: None,
-            max_connections: None,
-            connection_idle_timeout: None,
-        }],
-        routing: RoutingConfig {
-            default: Some("direct".to_owned()),
-            rules: Vec::new(),
-        },
-    })?);
+    let router = Arc::new(
+        Router::new(Config {
+            log_level: None,
+            acme: None,
+            inbounds: vec![inbound_cfg.clone()],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_owned(),
+                protocol: Protocol::Direct,
+                server: None,
+                server_name: None,
+                insecure: false,
+                ca_certificate: None,
+                username: None,
+                password: None,
+                uuid: None,
+                max_streams: None,
+                max_connections: None,
+                connection_idle_timeout: None,
+            }],
+            routing: RoutingConfig {
+                default: Some("direct".to_owned()),
+                rules: Vec::new(),
+            },
+        })
+        .await?,
+    );
     tokio::spawn(anytls_inbound::serve(listener, inbound_cfg, router));
     Ok((addr, ca_certificate))
 }
@@ -845,29 +858,32 @@ async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
         padding_scheme: Vec::new(),
         tls: Some(tls.server),
     };
-    let router = Arc::new(Router::new(Config {
-        log_level: None,
-        acme: None,
-        inbounds: vec![inbound_cfg.clone()],
-        outbounds: vec![OutboundConfig {
-            tag: "direct".to_owned(),
-            protocol: Protocol::Direct,
-            server: None,
-            server_name: None,
-            insecure: false,
-            ca_certificate: None,
-            username: None,
-            password: None,
-            uuid: None,
-            max_streams: None,
-            max_connections: None,
-            connection_idle_timeout: None,
-        }],
-        routing: RoutingConfig {
-            default: Some("direct".to_owned()),
-            rules: Vec::new(),
-        },
-    })?);
+    let router = Arc::new(
+        Router::new(Config {
+            log_level: None,
+            acme: None,
+            inbounds: vec![inbound_cfg.clone()],
+            outbounds: vec![OutboundConfig {
+                tag: "direct".to_owned(),
+                protocol: Protocol::Direct,
+                server: None,
+                server_name: None,
+                insecure: false,
+                ca_certificate: None,
+                username: None,
+                password: None,
+                uuid: None,
+                max_streams: None,
+                max_connections: None,
+                connection_idle_timeout: None,
+            }],
+            routing: RoutingConfig {
+                default: Some("direct".to_owned()),
+                rules: Vec::new(),
+            },
+        })
+        .await?,
+    );
     tokio::spawn(tuic_inbound::serve(socket, inbound_cfg, router));
     Ok((addr, ca_certificate))
 }
