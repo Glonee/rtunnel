@@ -32,6 +32,7 @@ pub struct AnytlsOutbound {
     cfg: OutboundConfig,
     state: Arc<Mutex<ClientState>>,
     sessions: Arc<Mutex<ClientSessionPool>>,
+    next_session_id: Arc<AtomicUsize>,
     tuning: ClientSessionTuning,
 }
 
@@ -57,21 +58,41 @@ struct ClientSessionPool {
     sessions: Vec<Arc<ClientSession>>,
 }
 
+struct RemovedClientSession {
+    session: Arc<ClientSession>,
+    reason: ClientSessionRemovalReason,
+    idle_for: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum ClientSessionRemovalReason {
+    Closed,
+    IdleExpired,
+}
+
 impl ClientSessionPool {
     fn remove_closed_and_expired(
         &mut self,
         idle_timeout: Duration,
         now: Instant,
-    ) -> Vec<Arc<ClientSession>> {
+    ) -> Vec<RemovedClientSession> {
         let mut removed = Vec::new();
         self.sessions.retain(|session| {
             if session.is_closed() {
-                removed.push(session.clone());
+                removed.push(RemovedClientSession {
+                    session: session.clone(),
+                    reason: ClientSessionRemovalReason::Closed,
+                    idle_for: now.saturating_duration_since(session.last_used()),
+                });
                 return false;
             }
             if session.is_idle_expired(idle_timeout, now) {
                 session.close();
-                removed.push(session.clone());
+                removed.push(RemovedClientSession {
+                    session: session.clone(),
+                    reason: ClientSessionRemovalReason::IdleExpired,
+                    idle_for: now.saturating_duration_since(session.last_used()),
+                });
                 return false;
             }
             true
@@ -160,11 +181,16 @@ impl AnytlsOutbound {
         cfg.require_server()?;
         let tuning = ClientSessionTuning::from_config(&cfg);
         let sessions = Arc::new(Mutex::new(ClientSessionPool::default()));
-        spawn_connection_cleaner(sessions.clone(), tuning.connection_idle_timeout);
+        spawn_connection_cleaner(
+            sessions.clone(),
+            tuning.connection_idle_timeout,
+            cfg.tag.clone(),
+        );
         Ok(Self {
             cfg,
             state: Arc::new(Mutex::new(ClientState::new()?)),
             sessions,
+            next_session_id: Arc::new(AtomicUsize::new(1)),
             tuning,
         })
     }
@@ -174,6 +200,7 @@ impl AnytlsOutbound {
             cfg: self.cfg.clone(),
             state: self.state.clone(),
             sessions: self.sessions.clone(),
+            next_session_id: self.next_session_id.clone(),
             tuning: self.tuning,
         }
     }
@@ -184,20 +211,35 @@ impl AnytlsOutbound {
                 let mut pool = self.sessions.lock().await;
                 pool.remove_closed_and_expired(self.tuning.connection_idle_timeout, Instant::now())
             };
-            shutdown_sessions(expired);
+            shutdown_sessions(expired, &self.cfg.tag);
 
             let mut pool = self.sessions.lock().await;
             if let Some(session) = pool.select(self.tuning) {
                 match session.reserve_stream() {
-                    Ok(stream_id) => return Ok((session, stream_id)),
+                    Ok(stream_id) => {
+                        let active_streams = session.active_stream_count();
+                        tracing::debug!(
+                            tag = %self.cfg.tag,
+                            session_id = session.id(),
+                            stream_id,
+                            active_streams,
+                            reused_idle_connection = active_streams == 1,
+                            "anytls outbound connection reused"
+                        );
+                        return Ok((session, stream_id));
+                    }
                     Err(err) if session.is_closed() => {
                         let expired = pool.remove_closed_and_expired(
                             self.tuning.connection_idle_timeout,
                             Instant::now(),
                         );
                         drop(pool);
-                        shutdown_sessions(expired);
-                        tracing::debug!(%err, "discarded closed anytls session");
+                        shutdown_sessions(expired, &self.cfg.tag);
+                        tracing::debug!(
+                            tag = %self.cfg.tag,
+                            %err,
+                            "discarded closed anytls outbound session"
+                        );
                         continue;
                     }
                     Err(err) => return Err(err),
@@ -207,12 +249,21 @@ impl AnytlsOutbound {
             let session = self.connect_session().await?;
             let stream_id = session.reserve_stream()?;
             pool.sessions.push(session.clone());
+            tracing::debug!(
+                tag = %self.cfg.tag,
+                session_id = session.id(),
+                stream_id,
+                active_streams = session.active_stream_count(),
+                connections = pool.sessions.len(),
+                "anytls outbound session added to pool"
+            );
             return Ok((session, stream_id));
         }
     }
 
     async fn connect_session(&self) -> anyhow::Result<Arc<ClientSession>> {
         let server = self.cfg.require_server()?;
+        let server_label = server.to_string();
         let tcp = server.connect_tcp().await?;
         let connector =
             tls::chrome_like_connector(self.cfg.insecure, self.cfg.ca_certificate.as_deref())?;
@@ -238,12 +289,21 @@ impl AnytlsOutbound {
         )?;
 
         let (tls_reader, tls_writer) = tokio::io::split(stream);
+        let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
         let session = Arc::new(ClientSession::new(
+            session_id,
+            self.cfg.tag.clone(),
             tls_writer,
             settings_frame,
             self.state.clone(),
         ));
         tokio::spawn(session.clone().run_reader(tls_reader, self.state.clone()));
+        tracing::debug!(
+            tag = %self.cfg.tag,
+            session_id,
+            server = %server_label,
+            "anytls outbound session created"
+        );
         Ok(session)
     }
 }
@@ -264,6 +324,14 @@ impl Outbound for AnytlsOutbound {
             let mut streams = session_state.streams.lock().await;
             streams.insert(stream_id, ClientStream { tx: data_tx });
         }
+        tracing::debug!(
+            tag = %self.cfg.tag,
+            session_id = session_state.id(),
+            stream_id,
+            target = %session.target,
+            active_streams = session_state.active_stream_count(),
+            "anytls outbound stream created"
+        );
 
         if let Err(err) = session_state
             .write_connect(stream_id, &session.target)
@@ -348,6 +416,8 @@ type TlsReadHalf = ReadHalf<SslStream<TcpStream>>;
 type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 
 struct ClientSession {
+    id: usize,
+    tag: String,
     writer: Arc<Mutex<ClientWriter<TlsWriteHalf>>>,
     streams: Arc<Mutex<HashMap<u32, ClientStream>>>,
     state: Arc<Mutex<ClientState>>,
@@ -362,8 +432,16 @@ struct ClientStream {
 }
 
 impl ClientSession {
-    fn new(writer: TlsWriteHalf, initial_buffer: Vec<u8>, state: Arc<Mutex<ClientState>>) -> Self {
+    fn new(
+        id: usize,
+        tag: String,
+        writer: TlsWriteHalf,
+        initial_buffer: Vec<u8>,
+        state: Arc<Mutex<ClientState>>,
+    ) -> Self {
         Self {
+            id,
+            tag,
             writer: Arc::new(Mutex::new(ClientWriter::new(writer, initial_buffer))),
             streams: Arc::new(Mutex::new(HashMap::new())),
             state,
@@ -372,6 +450,10 @@ impl ClientSession {
             last_used: StdMutex::new(Instant::now()),
             closed: AtomicBool::new(false),
         }
+    }
+
+    fn id(&self) -> usize {
+        self.id
     }
 
     fn is_closed(&self) -> bool {
@@ -417,6 +499,13 @@ impl ClientSession {
         let removed = self.streams.lock().await.remove(&stream_id).is_some();
         if removed {
             self.release_stream();
+            tracing::debug!(
+                tag = %self.tag,
+                session_id = self.id,
+                stream_id,
+                active_streams = self.active_stream_count(),
+                "anytls outbound stream closed"
+            );
         }
     }
 
@@ -430,6 +519,12 @@ impl ClientSession {
         if cleared > 0 {
             self.active_streams.store(0, Ordering::SeqCst);
             self.touch();
+            tracing::debug!(
+                tag = %self.tag,
+                session_id = self.id,
+                streams = cleared,
+                "anytls outbound streams cleared"
+            );
         }
     }
 
@@ -509,6 +604,8 @@ impl ClientSession {
                 }
                 Ok(frame) if frame.command == codec::CMD_SYNACK && !frame.data.is_empty() => {
                     tracing::warn!(
+                        tag = %self.tag,
+                        session_id = self.id,
                         stream_id = frame.stream_id,
                         message = %String::from_utf8_lossy(&frame.data),
                         "anytls stream open failed"
@@ -528,25 +625,45 @@ impl ClientSession {
                                 *state.lock().await = updated;
                             }
                             Err(err) => {
-                                tracing::warn!(%err, "invalid anytls padding scheme update");
+                                tracing::warn!(
+                                    tag = %self.tag,
+                                    session_id = self.id,
+                                    %err,
+                                    "invalid anytls padding scheme update"
+                                );
                             }
                         }
                     }
                 }
                 Ok(frame) if frame.command == codec::CMD_ALERT => {
                     tracing::warn!(
+                        tag = %self.tag,
+                        session_id = self.id,
                         message = %String::from_utf8_lossy(&frame.data),
                         "anytls server alert"
                     );
                     break;
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(err) => {
+                    tracing::debug!(
+                        tag = %self.tag,
+                        session_id = self.id,
+                        %err,
+                        "anytls outbound session reader stopped"
+                    );
+                    break;
+                }
             }
         }
 
         self.close();
         self.clear_streams().await;
+        tracing::debug!(
+            tag = %self.tag,
+            session_id = self.id,
+            "anytls outbound session closed"
+        );
     }
 }
 
@@ -622,6 +739,7 @@ where
 fn spawn_connection_cleaner(
     sessions: Arc<Mutex<ClientSessionPool>>,
     connection_idle_timeout: Duration,
+    tag: String,
 ) {
     tokio::spawn(async move {
         let mut interval =
@@ -636,7 +754,7 @@ fn spawn_connection_cleaner(
                 let mut pool = sessions.lock().await;
                 pool.remove_closed_and_expired(connection_idle_timeout, Instant::now())
             };
-            shutdown_sessions(expired);
+            shutdown_sessions(expired, &tag);
         }
     });
 }
@@ -652,11 +770,35 @@ fn connection_cleanup_interval(connection_idle_timeout: Duration) -> Duration {
     }
 }
 
-fn shutdown_sessions(sessions: Vec<Arc<ClientSession>>) {
-    for session in sessions {
+fn shutdown_sessions(sessions: Vec<RemovedClientSession>, tag: &str) {
+    for removed in sessions {
+        log_removed_session(&removed, tag);
+        let session = removed.session;
         tokio::spawn(async move {
             session.shutdown().await;
         });
+    }
+}
+
+fn log_removed_session(removed: &RemovedClientSession, tag: &str) {
+    let session = &removed.session;
+    match removed.reason {
+        ClientSessionRemovalReason::Closed => {
+            tracing::debug!(
+                tag = %tag,
+                session_id = session.id(),
+                active_streams = session.active_stream_count(),
+                "discarded closed anytls outbound session"
+            );
+        }
+        ClientSessionRemovalReason::IdleExpired => {
+            tracing::debug!(
+                tag = %tag,
+                session_id = session.id(),
+                idle_for_ms = removed.idle_for.as_millis() as u64,
+                "closing idle anytls outbound session"
+            );
+        }
     }
 }
 
