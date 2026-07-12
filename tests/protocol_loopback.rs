@@ -286,6 +286,35 @@ async fn anytls_max_streams_opens_new_connection_when_live_sessions_are_full() -
 }
 
 #[tokio::test]
+async fn anytls_local_close_releases_stream_without_peer_fin() -> anyhow::Result<()> {
+    let (server, ca_certificate, mut stream_events) = spawn_anytls_pool_probe_server(false).await?;
+    let client = AnytlsOutbound::new(anytls_probe_outbound(
+        server,
+        ca_certificate,
+        Some(1),
+        None,
+        None,
+    ))
+    .await?;
+    let session = anytls_probe_session();
+
+    let first = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let first_opened = recv_anytls_probe_event(&mut stream_events).await?;
+    assert_eq!(first_opened.connection, 1);
+
+    drop(first);
+    let first_closed = recv_anytls_probe_event(&mut stream_events).await?;
+    assert_eq!(first_closed, first_opened);
+
+    let _second = timeout(Duration::from_secs(5), client.dial(&session)).await??;
+    let second_opened = recv_anytls_probe_event(&mut stream_events).await?;
+    assert_eq!(second_opened.connection, 1);
+    assert!(second_opened.stream_id > first_opened.stream_id);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn anytls_max_connections_creates_connection_when_all_existing_are_active()
 -> anyhow::Result<()> {
     let (server, ca_certificate, mut opened_streams) =
@@ -760,6 +789,12 @@ async fn run_anytls_pool_probe_connection(
                         .await;
                     }
                 }
+            }
+            anytls_codec::CMD_FIN => {
+                let _ = opened_tx.send(AnytlsProbeEvent {
+                    connection,
+                    stream_id: frame.stream_id,
+                });
             }
             _ => {}
         }
