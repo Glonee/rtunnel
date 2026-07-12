@@ -280,13 +280,7 @@ impl Outbound for AnytlsOutbound {
                 loop {
                     match app_reader.read(&mut buf).await {
                         Ok(0) => {
-                            if session_state
-                                .write_frame(codec::CMD_FIN, stream_id, &[])
-                                .await
-                                .is_err()
-                            {
-                                session_state.shutdown().await;
-                            }
+                            session_state.close_stream(stream_id).await;
                             break;
                         }
                         Ok(n) => {
@@ -300,13 +294,7 @@ impl Outbound for AnytlsOutbound {
                             }
                         }
                         Err(_) => {
-                            if session_state
-                                .write_frame(codec::CMD_FIN, stream_id, &[])
-                                .await
-                                .is_err()
-                            {
-                                session_state.shutdown().await;
-                            }
+                            session_state.close_stream(stream_id).await;
                             break;
                         }
                     }
@@ -321,6 +309,7 @@ impl Outbound for AnytlsOutbound {
                     break;
                 }
             }
+            let _ = app_writer.shutdown().await;
             session_for_app_writer.remove_stream(stream_id).await;
         });
 
@@ -417,6 +406,17 @@ impl ClientSession {
         let removed = self.streams.lock().await.remove(&stream_id).is_some();
         if removed {
             self.release_stream();
+        }
+    }
+
+    async fn close_stream(&self, stream_id: u32) {
+        let write_failed = self
+            .write_frame(codec::CMD_FIN, stream_id, &[])
+            .await
+            .is_err();
+        self.remove_stream(stream_id).await;
+        if write_failed {
+            self.shutdown().await;
         }
     }
 
