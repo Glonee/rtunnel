@@ -12,6 +12,8 @@ Supported:
 - AnyTLS inbound and outbound over BoringSSL with TLS-exporter auth and binary
   CONNECT framing, UDP relay over streams, and negotiated client-side packet
   padding and splitting
+- AnyTLS HTTP fallback, either through a plaintext reverse-proxy target or a
+  built-in static 404 response
 - TUIC v5 inbound and outbound over `tokio-quiche`, including TCP relay,
   authentication, heartbeat, and UDP packet relay modes
 - Direct TCP and UDP outbound
@@ -32,6 +34,28 @@ Then point a SOCKS5 client at `127.0.0.1:1080`.
 
 Outbound `server` values accept either an IP socket address such as
 `127.0.0.1:8443` or a domain endpoint such as `proxy.example.com:8443`.
+
+## AnyTLS fallback
+
+AnyTLS inbounds negotiate TLS 1.3 when the client supports it, retain TLS 1.2
+compatibility, and prefer `h2` over `http/1.1` through ALPN. When
+authentication fails, the inbound serves a protocol-correct HTTP/2 or HTTP/1.1
+static 404 response by default. For a real cover service, configure a plaintext
+HTTP reverse-proxy target:
+
+```toml
+[[inbounds]]
+tag = "anytls-in"
+listen = "0.0.0.0:443"
+protocol = "anytls"
+fallback = "127.0.0.1:8080"
+```
+
+The outer TLS connection terminates in `rtunnel`, so the fallback target should
+accept plaintext HTTP rather than HTTPS. Because modern clients will negotiate
+`h2`, a raw fallback target should support prior-knowledge h2c as well as
+HTTP/1.1. The bytes inspected during AnyTLS authentication are preserved and
+forwarded to the fallback target.
 
 ## ACME certificates
 

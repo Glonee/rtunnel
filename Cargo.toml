@@ -15,7 +15,7 @@ clap = { version = "4.5.38", features = ["derive"] }
 foreign-types = "0.5.0"
 futures-util = "0.3.31"
 hex = "0.4.3"
-hyper014 = { package = "hyper", version = "0.14", features = ["http1", "server", "tcp"] }
+hyper014 = { package = "hyper", version = "0.14", features = ["http1", "http2", "server", "tcp"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
 md5 = "0.7.0"
 mimalloc = "0.1.52"
@@ -34,6 +34,8 @@ upstream-anytls = { package = "anytls", version = "0.3.4", default-features = fa
 uuid = { version = "1.11.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
+h2 = "0.3.27"
+http = "0.2.12"
 rcgen = "0.14.8"
 
 [profile.release]

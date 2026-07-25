@@ -201,6 +201,12 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum ClientHelloAuth {
+    Authenticated(String),
+    Rejected(Vec<u8>),
+}
+
 pub fn password_hash(password: &str) -> [u8; PASSWORD_HASH_LEN] {
     Sha256::digest(password.as_bytes()).into()
 }
@@ -232,19 +238,35 @@ pub async fn read_client_hello<S>(stream: &mut S, users: &[UserConfig]) -> anyho
 where
     S: AsyncRead + Unpin,
 {
+    match read_client_hello_or_fallback(stream, users).await? {
+        ClientHelloAuth::Authenticated(username) => Ok(username),
+        ClientHelloAuth::Rejected(_) => anyhow::bail!("anytls authentication failed"),
+    }
+}
+
+pub async fn read_client_hello_or_fallback<S>(
+    stream: &mut S,
+    users: &[UserConfig],
+) -> anyhow::Result<ClientHelloAuth>
+where
+    S: AsyncRead + Unpin,
+{
     let mut presented = [0; PASSWORD_HASH_LEN];
     stream.read_exact(&mut presented).await?;
+    let Some(username) = users
+        .iter()
+        .find(|user| password_hash(&user.password) == presented)
+        .map(|user| user.username.clone())
+    else {
+        return Ok(ClientHelloAuth::Rejected(presented.to_vec()));
+    };
+
     let padding_len = stream.read_u16().await?;
     if padding_len > 0 {
         let mut padding = vec![0; padding_len as usize];
         stream.read_exact(&mut padding).await?;
     }
-    for user in users {
-        if password_hash(&user.password) == presented {
-            return Ok(user.username.clone());
-        }
-    }
-    anyhow::bail!("anytls authentication failed")
+    Ok(ClientHelloAuth::Authenticated(username))
 }
 
 pub async fn read_frame<S>(stream: &mut S) -> anyhow::Result<Frame>
