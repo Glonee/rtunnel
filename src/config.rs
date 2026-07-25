@@ -66,6 +66,7 @@ pub struct InboundConfig {
     pub users: Option<Vec<UserConfig>>,
     #[serde(default)]
     pub padding_scheme: Vec<String>,
+    pub fallback: Option<ServerAddr>,
     pub tls: Option<TlsServerConfig>,
 }
 
@@ -538,6 +539,32 @@ default = "proxy"
     }
 
     #[test]
+    fn parses_anytls_inbound_fallback() {
+        let raw = r#"
+[[inbounds]]
+tag = "anytls-in"
+listen = "127.0.0.1:443"
+protocol = "anytls"
+fallback = "127.0.0.1:8080"
+
+[inbounds.tls]
+certificate = "cert.pem"
+private_key = "key.pem"
+
+[[outbounds]]
+tag = "direct"
+protocol = "direct"
+"#;
+
+        let cfg: Config = toml::from_str(raw).unwrap();
+
+        assert_eq!(
+            cfg.inbounds[0].fallback.as_ref().unwrap().to_string(),
+            "127.0.0.1:8080"
+        );
+    }
+
+    #[test]
     fn parses_ip_outbound_server() {
         let server: ServerAddr = "[::1]:443".parse().unwrap();
 
@@ -661,6 +688,7 @@ default = "anytls-out"
                 protocol: Protocol::Socks5,
                 users: None,
                 padding_scheme: Vec::new(),
+                fallback: None,
                 tls: None,
             }],
             outbounds: vec![OutboundConfig {
@@ -694,6 +722,7 @@ default = "anytls-out"
                 protocol: Protocol::Anytls,
                 users: None,
                 padding_scheme: Vec::new(),
+                fallback: None,
                 tls: Some(tls),
             }],
             outbounds: vec![OutboundConfig {

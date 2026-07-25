@@ -131,6 +131,155 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn anytls_inbound_negotiates_tls13_and_serves_h2_static_fallback() -> anyhow::Result<()> {
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
+    let stream = connect_anytls_tls(inbound_addr, &ca_certificate).await?;
+
+    assert_eq!(stream.ssl().version_str(), "TLSv1.3");
+    assert_eq!(stream.ssl().selected_alpn_protocol(), Some(&b"h2"[..]));
+
+    let (mut client, connection) = h2::client::handshake(stream).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .uri("https://localhost/not-found")
+        .body(())?;
+    let (response, _) = client.send_request(request, true)?;
+    let response = timeout(Duration::from_secs(5), response).await??;
+
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["server"], "nginx");
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    while let Some(chunk) = timeout(Duration::from_secs(5), body.data()).await? {
+        received.extend_from_slice(&chunk?);
+    }
+    assert!(received.ends_with(b"</html>"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_inbound_keeps_http1_static_fallback() -> anyhow::Result<()> {
+    let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
+    let mut stream =
+        connect_anytls_tls_with_alpn(inbound_addr, &ca_certificate, b"\x08http/1.1").await?;
+    assert_eq!(
+        stream.ssl().selected_alpn_protocol(),
+        Some(&b"http/1.1"[..])
+    );
+
+    stream
+        .write_all(b"GET /not-found HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await??;
+    assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+    assert!(response.ends_with(b"</html>"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_inbound_reverse_proxies_rejected_auth() -> anyhow::Result<()> {
+    let fallback_listener = TcpListener::bind(localhost(0)).await?;
+    let fallback_addr = fallback_listener.local_addr()?;
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = fallback_listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = request_tx.send(request);
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nfallback works",
+            )
+            .await;
+    });
+
+    let (inbound_addr, ca_certificate) =
+        spawn_anytls_inbound_with_options(Vec::new(), Some(fallback_addr.into())).await?;
+    let mut stream =
+        connect_anytls_tls_with_alpn(inbound_addr, &ca_certificate, b"\x08http/1.1").await?;
+    let request = b"GET /cover HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream.write_all(request).await?;
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await??;
+    assert!(response.ends_with(b"fallback works"));
+    assert_eq!(
+        timeout(Duration::from_secs(5), request_rx.recv())
+            .await?
+            .as_deref(),
+        Some(request.as_slice())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_inbound_reverse_proxies_h2_to_h2c() -> anyhow::Result<()> {
+    let fallback_listener = TcpListener::bind(localhost(0)).await?;
+    let fallback_addr = fallback_listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((stream, _)) = fallback_listener.accept().await else {
+            return;
+        };
+        let service = hyper014::service::service_fn(
+            |request: hyper014::Request<hyper014::Body>| async move {
+                assert_eq!(request.uri().path(), "/cover");
+                Ok::<_, std::convert::Infallible>(
+                    hyper014::Response::builder()
+                        .status(hyper014::StatusCode::OK)
+                        .body(hyper014::Body::from("h2 fallback works"))
+                        .unwrap(),
+                )
+            },
+        );
+        let _ = hyper014::server::conn::Http::new()
+            .http2_only(true)
+            .serve_connection(stream, service)
+            .await;
+    });
+
+    let (inbound_addr, ca_certificate) =
+        spawn_anytls_inbound_with_options(Vec::new(), Some(fallback_addr.into())).await?;
+    let stream = connect_anytls_tls(inbound_addr, &ca_certificate).await?;
+    assert_eq!(stream.ssl().selected_alpn_protocol(), Some(&b"h2"[..]));
+
+    let (mut client, connection) = h2::client::handshake(stream).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .uri("https://localhost/cover")
+        .body(())?;
+    let (response, _) = client.send_request(request, true)?;
+    let response = timeout(Duration::from_secs(5), response).await??;
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    while let Some(chunk) = timeout(Duration::from_secs(5), body.data()).await? {
+        received.extend_from_slice(&chunk?);
+    }
+    assert_eq!(received, b"h2 fallback works");
+    Ok(())
+}
+
+#[tokio::test]
 async fn anytls_udp_reaches_anytls_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_udp_echo_server().await?;
     let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
@@ -535,6 +684,7 @@ async fn spawn_socks5_inbound(credentials: Option<(&str, &str)>) -> anyhow::Resu
             }]
         }),
         padding_scheme: Vec::new(),
+        fallback: None,
         tls: None,
     };
     let router = Arc::new(
@@ -574,6 +724,13 @@ async fn spawn_anytls_inbound() -> anyhow::Result<(SocketAddr, String)> {
 async fn spawn_anytls_inbound_with_padding(
     padding_scheme: Vec<String>,
 ) -> anyhow::Result<(SocketAddr, String)> {
+    spawn_anytls_inbound_with_options(padding_scheme, None).await
+}
+
+async fn spawn_anytls_inbound_with_options(
+    padding_scheme: Vec<String>,
+    fallback: Option<rtunnel::config::ServerAddr>,
+) -> anyhow::Result<(SocketAddr, String)> {
     let listener = TcpListener::bind(localhost(0)).await?;
     let addr = listener.local_addr()?;
     let tls = write_test_tls_files()?;
@@ -588,6 +745,7 @@ async fn spawn_anytls_inbound_with_padding(
             password: "secret".to_owned(),
         }]),
         padding_scheme,
+        fallback,
         tls: Some(tls.server),
     };
     let router = Arc::new(
@@ -624,13 +782,39 @@ async fn connect_anytls_session(
     server: SocketAddr,
     ca_certificate: &str,
 ) -> anyhow::Result<SslStream<TcpStream>> {
+    let mut stream = connect_anytls_tls(server, ca_certificate).await?;
+    anytls_codec::write_client_hello(&mut stream, "secret").await?;
+    Ok(stream)
+}
+
+async fn connect_anytls_tls(
+    server: SocketAddr,
+    ca_certificate: &str,
+) -> anyhow::Result<SslStream<TcpStream>> {
+    connect_anytls_tls_with_optional_alpn(server, ca_certificate, None).await
+}
+
+async fn connect_anytls_tls_with_alpn(
+    server: SocketAddr,
+    ca_certificate: &str,
+    alpn: &[u8],
+) -> anyhow::Result<SslStream<TcpStream>> {
+    connect_anytls_tls_with_optional_alpn(server, ca_certificate, Some(alpn)).await
+}
+
+async fn connect_anytls_tls_with_optional_alpn(
+    server: SocketAddr,
+    ca_certificate: &str,
+    alpn: Option<&[u8]>,
+) -> anyhow::Result<SslStream<TcpStream>> {
     let tcp = TcpStream::connect(server).await?;
     let connector = tls::chrome_like_connector(false, Some(ca_certificate))?;
     let mut ssl = connector.configure()?.into_ssl("localhost")?;
     tls::configure_chrome_like_ssl(&mut ssl)?;
-    let mut stream = SslStreamBuilder::new(ssl, tcp).connect().await?;
-    anytls_codec::write_client_hello(&mut stream, "secret").await?;
-    Ok(stream)
+    if let Some(alpn) = alpn {
+        ssl.set_alpn_protos(alpn)?;
+    }
+    Ok(SslStreamBuilder::new(ssl, tcp).connect().await?)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -891,6 +1075,7 @@ async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
             password: "secret".to_owned(),
         }]),
         padding_scheme: Vec::new(),
+        fallback: None,
         tls: Some(tls.server),
     };
     let router = Arc::new(

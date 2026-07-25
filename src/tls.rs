@@ -8,8 +8,9 @@ use anyhow::{Context, ensure};
 use boring::{
     pkey::{PKey, Private},
     ssl::{
-        CertificateCompressionAlgorithm, CertificateCompressor, SelectCertError, SslAcceptor,
-        SslConnector, SslContextBuilder, SslMethod, SslOptions, SslRef, SslVerifyMode, SslVersion,
+        AlpnError, CertificateCompressionAlgorithm, CertificateCompressor, SelectCertError,
+        SslAcceptor, SslConnector, SslContextBuilder, SslMethod, SslOptions, SslRef, SslVerifyMode,
+        SslVersion, select_next_proto,
     },
     x509::X509,
 };
@@ -44,10 +45,10 @@ const CHROME_SIGNATURE_ALGORITHMS: &str = "\
     rsa_pss_rsae_sha384:\
     rsa_pkcs1_sha384:\
     rsa_pss_rsae_sha512:\
-    rsa_pkcs1_sha512:\
-    rsa_pkcs1_sha1";
+    rsa_pkcs1_sha512";
 
 const CHROME_SUPPORTED_GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
+const SERVER_ALPN_PREFERENCE: &[u8] = b"\x02h2\x08http/1.1";
 const CHROME_H2_ALPS_SETTINGS: &[u8] = &[
     0x00, 0x01, 0x00, 0x00, 0x01, 0x00, // HEADER_TABLE_SIZE = 65536
     0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // ENABLE_PUSH = 0
@@ -151,12 +152,16 @@ impl CertificateCompressor for BrotliCertificateDecompressor {
 pub fn server_acceptor(tls: &TlsServerConfig) -> anyhow::Result<SslAcceptor> {
     let cert_path = tls.certificate_path()?.to_owned();
     let key_path = tls.private_key_path()?.to_owned();
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     load_certificate_into_context(&mut builder, &cert_path, &key_path)?;
     if tls.acme.is_some() {
         install_certificate_reload_callback(&mut builder, cert_path, key_path);
     }
-    builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    builder.set_alpn_select_callback(|_, client_protocols| {
+        select_next_proto(SERVER_ALPN_PREFERENCE, client_protocols).ok_or(AlpnError::NOACK)
+    });
     Ok(builder.build())
 }
 

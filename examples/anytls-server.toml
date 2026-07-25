@@ -4,7 +4,9 @@ log_level = "info"
 tag = "anytls-in"
 listen = "127.0.0.1:8443"
 protocol = "anytls"
-padding_scheme = ["0=30-30"]
+# Optional plaintext HTTP cover service used after the outer TLS handshake
+# when AnyTLS authentication fails. It should support h2c and HTTP/1.1.
+# fallback = "127.0.0.1:8080"
 
 [[inbounds.users]]
 name = "demo"

@@ -1,12 +1,20 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
+    io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::Context;
+use hyper014::{Body, Response, StatusCode, server::conn::Http, service::service_fn};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf,
+        copy_bidirectional,
+    },
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc},
 };
@@ -23,6 +31,9 @@ use crate::{
 
 type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
 const UOT_CHANNEL_CAPACITY: usize = 128;
+const STATIC_FALLBACK_BODY: &[u8] =
+    b"<!doctype html><html><head><title>404 Not Found</title></head>\
+<body><h1>404 Not Found</h1></body></html>";
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(cfg.listen).await?;
@@ -63,7 +74,14 @@ pub async fn serve(
                     .users
                     .as_deref()
                     .context("anytls inbound requires users")?;
-                let username = codec::read_client_hello(&mut tls_stream, users).await?;
+                let username =
+                    match codec::read_client_hello_or_fallback(&mut tls_stream, users).await? {
+                        codec::ClientHelloAuth::Authenticated(username) => username,
+                        codec::ClientHelloAuth::Rejected(prefix) => {
+                            serve_fallback(tls_stream, &cfg, prefix, peer).await?;
+                            return Ok(());
+                        }
+                    };
                 let (mut reader, writer) = tokio::io::split(tls_stream);
                 let writer = Arc::new(Mutex::new(writer));
                 let mut streams: HashMap<u32, InboundStream> = HashMap::new();
@@ -185,6 +203,114 @@ pub async fn serve(
                 debug!(%peer, %err, "anytls session failed");
             }
         });
+    }
+}
+
+async fn serve_fallback(
+    mut tls_stream: SslStream<TcpStream>,
+    cfg: &InboundConfig,
+    prefix: Vec<u8>,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
+    let alpn = tls_stream
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|protocol| String::from_utf8_lossy(protocol).into_owned());
+
+    if let Some(fallback) = &cfg.fallback {
+        let mut upstream = fallback.connect_tcp().await?;
+        upstream.write_all(&prefix).await?;
+        debug!(
+            %peer,
+            fallback = %fallback,
+            alpn = alpn.as_deref().unwrap_or("none"),
+            "anytls authentication rejected; proxying to fallback"
+        );
+        copy_bidirectional(&mut tls_stream, &mut upstream).await?;
+        return Ok(());
+    }
+
+    let h2 = alpn.as_deref() == Some("h2");
+    let io = PrefixedIo::new(prefix, tls_stream);
+    let service = service_fn(|_| async {
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("server", "nginx")
+                .header("content-type", "text/html")
+                .body(Body::from(STATIC_FALLBACK_BODY))
+                .expect("static fallback response is valid"),
+        )
+    });
+    let mut http = Http::new();
+    if h2 {
+        http.http2_only(true);
+    } else {
+        http.http1_only(true);
+    }
+    http.serve_connection(io, service).await?;
+    debug!(
+        %peer,
+        alpn = alpn.as_deref().unwrap_or("none"),
+        "anytls authentication rejected; served static fallback"
+    );
+    Ok(())
+}
+
+struct PrefixedIo<S> {
+    prefix: Cursor<Vec<u8>>,
+    inner: S,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix: Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedIo<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let position = this.prefix.position() as usize;
+        let prefix = this.prefix.get_ref();
+        if position < prefix.len() {
+            let len = buf.remaining().min(prefix.len() - position);
+            buf.put_slice(&prefix[position..position + len]);
+            this.prefix.set_position((position + len) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedIo<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
