@@ -45,8 +45,7 @@ const CHROME_SIGNATURE_ALGORITHMS: &str = "\
     rsa_pss_rsae_sha384:\
     rsa_pkcs1_sha384:\
     rsa_pss_rsae_sha512:\
-    rsa_pkcs1_sha512:\
-    rsa_pkcs1_sha1";
+    rsa_pkcs1_sha512";
 
 const CHROME_SUPPORTED_GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384";
 const SERVER_ALPN_PREFERENCE: &[u8] = b"\x02h2\x08http/1.1";
