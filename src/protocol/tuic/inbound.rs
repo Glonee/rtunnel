@@ -126,7 +126,6 @@ struct TuicApp {
     outbound_tx: mpsc::Sender<QuicWrite>,
     outbound_rx: mpsc::Receiver<QuicWrite>,
     pending_writes: VecDeque<QuicWrite>,
-    buffer: [u8; 16 * 1024],
 }
 
 struct StreamState {
@@ -197,7 +196,6 @@ impl TuicApp {
             outbound_tx,
             outbound_rx,
             pending_writes: VecDeque::new(),
-            buffer: [0; 16 * 1024],
         }
     }
 
@@ -417,10 +415,6 @@ impl ApplicationOverQuic for TuicApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buffer
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {

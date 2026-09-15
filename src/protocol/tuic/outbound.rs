@@ -213,7 +213,6 @@ struct TuicClientApp {
     stream_tx: mpsc::Sender<Vec<u8>>,
     pending_writes: VecDeque<QuicWrite>,
     next_heartbeat: Instant,
-    buffer: [u8; 16 * 1024],
 }
 
 enum QuicWrite {
@@ -238,7 +237,6 @@ impl TuicClientApp {
             stream_tx,
             pending_writes: VecDeque::new(),
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
-            buffer: [0; 16 * 1024],
         }
     }
 
@@ -280,10 +278,6 @@ impl ApplicationOverQuic for TuicClientApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buffer
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
@@ -421,7 +415,6 @@ struct TuicUdpOutboundApp {
     packet_assembler: codec::PacketAssembler,
     stream_buffers: HashMap<u64, Vec<u8>>,
     next_heartbeat: Instant,
-    buffer: [u8; 16 * 1024],
 }
 
 impl TuicUdpOutboundApp {
@@ -440,7 +433,6 @@ impl TuicUdpOutboundApp {
             packet_assembler: codec::PacketAssembler::default(),
             stream_buffers: HashMap::new(),
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
-            buffer: [0; 16 * 1024],
         }
     }
 
@@ -472,10 +464,6 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buffer
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
