@@ -93,7 +93,7 @@ TLS outbounds apply Chrome-like defaults:
   Brotli certificate decompression
 - SNI enabled
 
-TUIC/H3 uses a pinned quiche fork with BoringSSL 5.x support and opt-in
+TUIC/H3 uses upstream BoringSSL 5.x support and a pinned quiche fork with opt-in
 fingerprint controls for ECH GREASE, h3 ALPS, and extra QUIC transport
 parameters. The outbound TUIC path advertises Chrome-like QUIC transport
 parameters, TLS application settings, signature algorithms, certificate

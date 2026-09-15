@@ -8,8 +8,8 @@ license = "GPL-3.0-or-later"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 base64 = "0.22.1"
-boring = "5.1"
-boring-sys = "5.1"
+boring = "5.2"
+boring-sys = "5.2"
 brotli = "8.0"
 clap = { version = "4.5.38", features = ["derive"] }
 foreign-types = "0.5.0"
@@ -48,8 +48,8 @@ debug = false
 debug-assertions = false
 overflow-checks = false
 
-# Temporary fork until upstream quiche has boring 5.x support plus the
-# opt-in TLS/QUIC fingerprint controls needed for Chrome-like H3.
+# Fork with opt-in TLS/QUIC fingerprint controls needed for Chrome-like H3.
+# BoringSSL 5.x support is provided by upstream quiche.
 [patch.crates-io]
-quiche = { git = "https://github.com/Glonee/quiche.git", rev = "c6cb572fc9ada24cb744e2c97c3e174d4e3fb260" }
-tokio-quiche = { git = "https://github.com/Glonee/quiche.git", rev = "c6cb572fc9ada24cb744e2c97c3e174d4e3fb260" }
+quiche = { git = "https://github.com/Glonee/quiche.git", rev = "e9a4097fe0d523ba3d4094301e66d55030dc7a69" }
+tokio-quiche = { git = "https://github.com/Glonee/quiche.git", rev = "e9a4097fe0d523ba3d4094301e66d55030dc7a69" }

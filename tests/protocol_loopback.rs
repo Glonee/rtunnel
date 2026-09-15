@@ -1200,7 +1200,6 @@ struct TuicUdpClientApp {
     response_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_writes: VecDeque<TuicTestUdpWrite>,
     response_streams: HashMap<u64, Vec<u8>>,
-    buffer: [u8; 16 * 1024],
 }
 
 impl TuicUdpClientApp {
@@ -1217,7 +1216,6 @@ impl TuicUdpClientApp {
             response_tx,
             pending_writes: VecDeque::new(),
             response_streams: HashMap::new(),
-            buffer: [0; 16 * 1024],
         }
     }
 
@@ -1302,10 +1300,6 @@ impl ApplicationOverQuic for TuicUdpClientApp {
 
     fn should_act(&self) -> bool {
         true
-    }
-
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buffer
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
