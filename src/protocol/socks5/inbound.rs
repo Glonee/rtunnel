@@ -228,14 +228,14 @@ async fn handle_udp_associate(
             }
             received = socket.recv_from(&mut udp_buf) => {
                 let (read, client) = received?;
-                if client_addr.is_none() {
-                    client_addr = Some(client);
-                }
-                if client_addr != Some(client) {
+                if !udp_client_allowed(peer, session.target.port(), client_addr, client) {
                     continue;
                 }
                 match codec::decode_udp_packet(&udp_buf[..read]) {
                     Ok((target, payload)) => {
+                        // Only a valid packet from the expected peer may claim an
+                        // association whose client port was initially unknown.
+                        client_addr = Some(client);
                         debug!(target = %target, inbound = %session.inbound, "socks5 udp packet");
                         outbound.send_to(&target, &payload).await?;
                         last_activity = Instant::now();
@@ -250,6 +250,19 @@ async fn handle_udp_associate(
         }
     }
     Ok(())
+}
+
+fn udp_client_allowed(
+    peer: SocketAddr,
+    requested_port: u16,
+    client_addr: Option<SocketAddr>,
+    source: SocketAddr,
+) -> bool {
+    // Use the authenticated TCP peer's IP, not an address supplied by the
+    // client (which may also be a private address behind NAT).
+    source.ip().to_canonical() == peer.ip().to_canonical()
+        && (requested_port == 0 || source.port() == requested_port)
+        && client_addr.is_none_or(|client| client == source)
 }
 
 fn localhost(port: u16) -> SocketAddr {
@@ -267,4 +280,48 @@ fn udp_reply_addr(control_addr: SocketAddr, udp_addr: SocketAddr) -> SocketAddr 
         udp_addr.ip()
     };
     SocketAddr::new(ip, udp_addr.port())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_association_rejects_other_ips_before_and_after_port_selection() {
+        for (peer, client, other) in [
+            ("192.0.2.1:40000", "192.0.2.1:50000", "192.0.2.2:50000"),
+            (
+                "[2001:db8::1]:40000",
+                "[2001:db8::1]:50000",
+                "[2001:db8::2]:50000",
+            ),
+        ] {
+            let peer = peer.parse().unwrap();
+            let client = client.parse().unwrap();
+            let other = other.parse().unwrap();
+            assert!(!udp_client_allowed(peer, 0, None, other));
+            assert!(!udp_client_allowed(peer, 0, Some(client), other));
+            assert!(udp_client_allowed(peer, 0, None, client));
+        }
+    }
+
+    #[test]
+    fn udp_association_honors_requested_and_learned_ports() {
+        let peer = "192.0.2.1:40000".parse().unwrap();
+        let client = "192.0.2.1:50000".parse().unwrap();
+        let other = "192.0.2.1:50001".parse().unwrap();
+        assert!(udp_client_allowed(peer, 50000, None, client));
+        assert!(!udp_client_allowed(peer, 50000, None, other));
+        assert!(!udp_client_allowed(peer, 0, Some(client), other));
+    }
+
+    #[test]
+    fn udp_association_accepts_ipv4_mapped_tcp_peers() {
+        assert!(udp_client_allowed(
+            "[::ffff:192.0.2.1]:40000".parse().unwrap(),
+            0,
+            None,
+            "192.0.2.1:50000".parse().unwrap(),
+        ));
+    }
 }
