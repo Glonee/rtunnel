@@ -3,6 +3,8 @@
 [![unit tests](https://github.com/Glonee/rtunnel/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/Glonee/rtunnel/actions/workflows/unit-tests.yml)
 [![sing-box interop](https://github.com/Glonee/rtunnel/actions/workflows/sing-box-interop.yml/badge.svg)](https://github.com/Glonee/rtunnel/actions/workflows/sing-box-interop.yml)
 
+**WIP! Use at your own risk!**
+
 `rtunnel` is a Rust sing-box-like proxy with protocol-specific inbound and
 outbound implementations.
 
