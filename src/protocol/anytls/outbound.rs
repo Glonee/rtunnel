@@ -882,7 +882,7 @@ impl ProxyDatagram for AnytlsUdpSession {
 fn spawn_uot_stream(
     client: AnytlsOutbound,
     target: TargetAddr,
-    mut payload_rx: mpsc::Receiver<Vec<u8>>,
+    payload_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
     last_used: Arc<StdMutex<Instant>>,
 ) {
@@ -894,28 +894,7 @@ fn spawn_uot_stream(
                 target: codec::uot_v2_magic_target(),
             };
             let stream = client.dial(&session).await?;
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            codec::write_uot_v2_request(&mut writer, true, &target).await?;
-
-            loop {
-                tokio::select! {
-                    payload = payload_rx.recv() => {
-                        let Some(payload) = payload else {
-                            break;
-                        };
-                        touch_udp_activity(&last_used, Instant::now());
-                        codec::write_uot_payload(&mut writer, &payload).await?;
-                    }
-                    payload = codec::read_uot_payload(&mut reader) => {
-                        let payload = payload?;
-                        touch_udp_activity(&last_used, Instant::now());
-                        if response_tx.send((target.clone(), payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(())
+            relay_uot_stream(stream, &target, payload_rx, response_tx, &last_used).await
         }
         .await;
 
@@ -923,6 +902,41 @@ fn spawn_uot_stream(
             tracing::debug!(%err, target = %target, "anytls udp stream failed");
         }
     });
+}
+
+async fn relay_uot_stream(
+    stream: BoxStream,
+    target: &TargetAddr,
+    mut payload_rx: mpsc::Receiver<Vec<u8>>,
+    response_tx: mpsc::Sender<(TargetAddr, Vec<u8>)>,
+    last_used: &StdMutex<Instant>,
+) -> anyhow::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    codec::write_uot_v2_request(&mut writer, true, target).await?;
+
+    loop {
+        let next = codec::read_uot_payload(&mut reader);
+        tokio::pin!(next);
+        loop {
+            tokio::select! {
+                payload = payload_rx.recv() => {
+                    let Some(payload) = payload else {
+                        return Ok(());
+                    };
+                    touch_udp_activity(last_used, Instant::now());
+                    codec::write_uot_payload(&mut writer, &payload).await?;
+                }
+                payload = &mut next => {
+                    let payload = payload?;
+                    touch_udp_activity(last_used, Instant::now());
+                    if response_tx.send((target.clone(), payload)).await.is_err() {
+                        return Ok(());
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn spawn_udp_stream_cleaner(streams: Arc<Mutex<HashMap<TargetAddr, AnytlsUdpStream>>>) {
@@ -978,6 +992,46 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    #[tokio::test]
+    async fn udp_response_framing_survives_concurrent_requests() {
+        for split in [1, 3] {
+            let (stream, mut peer) = tokio::io::duplex(256);
+            let target: TargetAddr = "127.0.0.1:1234"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into();
+            let (payload_tx, payload_rx) = mpsc::channel(1);
+            let (response_tx, mut response_rx) = mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                relay_uot_stream(
+                    Box::new(stream),
+                    &target,
+                    payload_rx,
+                    response_tx,
+                    &StdMutex::new(Instant::now()),
+                )
+                .await
+            });
+            // Consume connect-mode flag and IPv4 request address.
+            peer.read_exact(&mut [0; 8]).await.unwrap();
+            let response = codec::encode_uot_payload(b"response").unwrap();
+            peer.write_all(&response[..split]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            payload_tx.send(b"request".to_vec()).await.unwrap();
+            assert_eq!(
+                codec::read_uot_payload(&mut peer).await.unwrap(),
+                b"request"
+            );
+            peer.write_all(&response[split..]).await.unwrap();
+            let (_, received) = tokio::time::timeout(Duration::from_secs(1), response_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, b"response");
+            drop(payload_tx);
+            task.await.unwrap().unwrap();
+        }
+    }
     fn frame_header(data: &[u8], offset: usize) -> (u8, u32, u16) {
         (
             data[offset],

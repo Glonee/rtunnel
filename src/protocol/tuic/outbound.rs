@@ -140,6 +140,7 @@ impl Outbound for TuicOutbound {
                     break;
                 }
             }
+            let _ = app_writer.shutdown().await;
         });
 
         let app = TuicClientApp::new(self.uuid, self.password.clone(), target, quic_rx, stream_tx);
@@ -210,7 +211,7 @@ struct TuicClientApp {
     password: String,
     target: TargetAddr,
     outbound_rx: mpsc::Receiver<QuicWrite>,
-    stream_tx: mpsc::Sender<Vec<u8>>,
+    stream_tx: Option<mpsc::Sender<Vec<u8>>>,
     pending_writes: VecDeque<QuicWrite>,
     next_heartbeat: Instant,
 }
@@ -234,7 +235,7 @@ impl TuicClientApp {
             password,
             target,
             outbound_rx,
-            stream_tx,
+            stream_tx: Some(stream_tx),
             pending_writes: VecDeque::new(),
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
         }
@@ -283,7 +284,7 @@ impl ApplicationOverQuic for TuicClientApp {
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
         if self.pending_writes.is_empty() {
             tokio::select! {
-                write = self.outbound_rx.recv() => {
+                write = self.outbound_rx.recv(), if !self.outbound_rx.is_closed() || !self.outbound_rx.is_empty() => {
                     if let Some(write) = write {
                         self.pending_writes.push_back(write);
                     }
@@ -305,7 +306,8 @@ impl ApplicationOverQuic for TuicClientApp {
                     Ok((read, fin)) => {
                         if stream_id == CONNECT_STREAM_ID
                             && read > 0
-                            && let Err(err) = self.stream_tx.try_send(buf[..read].to_vec())
+                            && let Some(tx) = &self.stream_tx
+                            && let Err(err) = tx.try_send(buf[..read].to_vec())
                         {
                             return Err(anyhow::anyhow!(
                                 "tuic outbound receive queue backpressure: {err}"
@@ -313,6 +315,9 @@ impl ApplicationOverQuic for TuicClientApp {
                             .into());
                         }
                         if fin {
+                            if stream_id == CONNECT_STREAM_ID {
+                                self.stream_tx.take();
+                            }
                             break;
                         }
                     }
@@ -378,6 +383,10 @@ struct TuicUdpSession {
 #[async_trait]
 impl ProxyDatagram for TuicUdpSession {
     async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            payload.len() <= u16::MAX as usize,
+            "tuic UDP packet is too large"
+        );
         let packet = codec::Packet {
             assoc_id: 1,
             pkt_id: self.pkt_id.fetch_add(1, Ordering::SeqCst),
@@ -529,6 +538,22 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
                         Err(quiche::Error::Done) => {
                             self.pending_writes.push_front(TuicUdpWrite::Packet(packet));
                             break;
+                        }
+                        Err(quiche::Error::BufferTooShort) => {
+                            match codec::fragment_packet(
+                                &packet,
+                                qconn.dgram_max_writable_len().unwrap_or(0),
+                            ) {
+                                Ok(fragments) => {
+                                    for fragment in fragments.into_iter().rev() {
+                                        self.pending_writes
+                                            .push_front(TuicUdpWrite::Packet(fragment));
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!(%err, "dropped TUIC UDP packet exceeding datagram limit")
+                                }
+                            }
                         }
                         Err(err) => return Err(Box::new(err)),
                     }

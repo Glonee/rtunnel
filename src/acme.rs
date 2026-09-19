@@ -264,7 +264,7 @@ fn configure_targets(
         let domains = acme.domains.clone();
         let target = targets_by_domains
             .entry(domains.clone())
-            .or_insert_with(|| target_for_domains(acme_cfg, &domains));
+            .or_insert(target_for_domains(acme_cfg, &domains)?);
 
         tls.certificate = Some(target.cert_path.to_string_lossy().into_owned());
         tls.private_key = Some(target.key_path.to_string_lossy().into_owned());
@@ -273,15 +273,23 @@ fn configure_targets(
     Ok(targets_by_domains.into_values().collect())
 }
 
-fn target_for_domains(acme_cfg: &AcmeConfig, domains: &[String]) -> AcmeTarget {
+fn target_for_domains(acme_cfg: &AcmeConfig, domains: &[String]) -> anyhow::Result<AcmeTarget> {
     let slug = domain_slug(domains);
-    let dir = acme_cfg.cache_dir.join("certificates").join(slug);
-    AcmeTarget {
+    // Resolve aliases before hashing so aliases and explicit URLs share a cache,
+    // while different CAs (including staging/production) cannot share certificates.
+    let directory = directory_url(&acme_cfg.directory)?;
+    let namespace = hex::encode(Sha256::digest(directory.as_bytes()));
+    let dir = acme_cfg
+        .cache_dir
+        .join("certificates")
+        .join(namespace)
+        .join(slug);
+    Ok(AcmeTarget {
         domains: domains.to_vec(),
         cert_path: dir.join(CERT_FILE),
         key_path: dir.join(KEY_FILE),
         dir,
-    }
+    })
 }
 
 async fn start_challenge_server(
@@ -554,6 +562,47 @@ fn stable_slug(input: &str) -> String {
 mod tests {
     use super::*;
     use hyper014::body::to_bytes;
+
+    #[test]
+    fn certificate_cache_separates_directories_and_reuses_aliases() {
+        let root = std::env::temp_dir().join(format!("rtunnel-acme-{}", uuid::Uuid::new_v4()));
+        let mut cfg = AcmeConfig {
+            cache_dir: root.clone(),
+            directory: "staging".into(),
+            ..AcmeConfig::default()
+        };
+        let domains = vec!["proxy.example.com".to_owned()];
+        let staging = target_for_domains(&cfg, &domains).unwrap();
+        cfg.directory = LetsEncrypt::Staging.url().to_owned();
+        assert_eq!(staging.dir, target_for_domains(&cfg, &domains).unwrap().dir);
+        cfg.directory = "production".into();
+        let production = target_for_domains(&cfg, &domains).unwrap();
+        assert_ne!(staging.dir, production.dir);
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(domains.clone())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        for dir in [
+            &staging.dir,
+            &root.join("certificates").join(domain_slug(&domains)),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(CERT_FILE), cert.pem()).unwrap();
+            fs::write(dir.join(KEY_FILE), key.serialize_pem()).unwrap();
+        }
+        assert_eq!(certificate_cache_status(&staging, 30), CacheStatus::Valid);
+        assert_eq!(
+            certificate_cache_status(&production, 30),
+            CacheStatus::MissingOrInvalid
+        );
+        cfg.directory = "https://ca.example/a/b".into();
+        let custom = target_for_domains(&cfg, &domains).unwrap();
+        cfg.directory = "https://ca.example/a_b".into();
+        assert_ne!(custom.dir, target_for_domains(&cfg, &domains).unwrap().dir);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn challenge_request_serves_known_token() {

@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::Parser;
 use mimalloc::MiMalloc;
 use rtunnel::{acme::AcmeManager, config::Config, protocol, router::Router};
-use tokio::signal;
+use tokio::{signal, task::JoinSet};
 use tracing::info;
 
 #[global_allocator]
@@ -36,19 +36,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router = Arc::new(Router::new(cfg.clone()).await?);
+    let mut inbounds = JoinSet::new();
     for inbound_cfg in cfg.inbounds.clone() {
         let router = router.clone();
-        tokio::spawn(async move {
-            if let Err(err) = protocol::run_inbound(inbound_cfg, router).await {
-                tracing::error!(%err, "inbound exited");
-            }
+        inbounds.spawn(async move {
+            let label = format!("inbound {} on {}", inbound_cfg.tag, inbound_cfg.listen);
+            protocol::run_inbound(inbound_cfg, router)
+                .await
+                .with_context(|| format!("{label} failed"))?;
+            anyhow::bail!("{label} exited unexpectedly")
         });
     }
 
     info!("rtunnel started");
-    signal::ctrl_c()
-        .await
-        .context("failed to wait for ctrl-c")?;
+    tokio::select! {
+        result = inbounds.join_next() => {
+            return result.context("no inbounds configured")?
+                .context("inbound task failed")?;
+        }
+        result = signal::ctrl_c() => result.context("failed to wait for ctrl-c")?,
+    }
+    inbounds.abort_all();
     info!("rtunnel stopped");
     Ok(())
 }
