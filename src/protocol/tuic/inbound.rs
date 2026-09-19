@@ -545,12 +545,15 @@ impl ApplicationOverQuic for TuicApp {
                         }
                     }
                     Err(quiche::Error::Done) => break,
-                    Err(err) => return Err(Box::new(err)),
+                    Err(err) => {
+                        debug!(%err, stream_id, "tuic stream read failed");
+                        return Err(Box::new(err));
+                    }
                 }
             }
         }
 
-        let mut dgram = [0; 1500];
+        let mut dgram = [0; 64 * 1024];
         while let Ok(read) = qconn.dgram_recv(&mut dgram) {
             if read >= 2 && dgram[0] == codec::VERSION && dgram[1] == codec::CMD_HEARTBEAT {
                 let _ = qconn.dgram_send(&dgram[..2]);
@@ -584,6 +587,9 @@ impl ApplicationOverQuic for TuicApp {
                         });
                         break;
                     }
+                    // An empty FIN needs no flow-control capacity. Done here
+                    // means the stream has already been collected by QUIC.
+                    Err(quiche::Error::Done) if fin && data.is_empty() => {}
                     Err(quiche::Error::Done) => {
                         self.pending_writes.push_front(QuicWrite::Data {
                             stream_id,
@@ -592,7 +598,10 @@ impl ApplicationOverQuic for TuicApp {
                         });
                         break;
                     }
-                    Err(err) => return Err(Box::new(err)),
+                    Err(err) => {
+                        debug!(%err, stream_id, "tuic stream write failed");
+                        return Err(Box::new(err));
+                    }
                 },
                 QuicWrite::Datagram { assoc_id, data } => {
                     if let Some(assoc_id) = assoc_id {
@@ -604,6 +613,27 @@ impl ApplicationOverQuic for TuicApp {
                             self.pending_writes
                                 .push_front(QuicWrite::Datagram { assoc_id, data });
                             break;
+                        }
+                        Err(quiche::Error::BufferTooShort) => {
+                            let fragments = codec::parse_packet(&data).and_then(|packet| {
+                                codec::fragment_packet(
+                                    &packet,
+                                    qconn.dgram_max_writable_len().unwrap_or(0),
+                                )
+                            });
+                            match fragments {
+                                Ok(fragments) => {
+                                    for fragment in fragments.into_iter().rev() {
+                                        self.pending_writes.push_front(QuicWrite::Datagram {
+                                            assoc_id,
+                                            data: codec::encode_packet(&fragment)?,
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    debug!(%err, "dropped TUIC UDP response exceeding datagram limit")
+                                }
+                            }
                         }
                         Err(err) => return Err(Box::new(err)),
                     }
@@ -672,26 +702,31 @@ fn spawn_relay(
             }
 
             let mut buf = [0; 16 * 1024];
-            loop {
+            let mut client_closed = false;
+            let mut remote_closed = false;
+            while !client_closed || !remote_closed {
                 tokio::select! {
                     biased;
 
-                    maybe_data = client_rx.recv() => {
+                    maybe_data = client_rx.recv(), if !client_closed => {
                         match maybe_data {
                             Some(data) => outbound.write_all(&data).await?,
-                            None => break,
+                            None => {
+                                outbound.shutdown().await?;
+                                client_closed = true;
+                            }
                         }
                     }
-                    read = outbound.read(&mut buf) => {
+                    read = outbound.read(&mut buf), if !remote_closed => {
                         let read = read?;
                         if read == 0 {
-                            break;
+                            remote_closed = true;
                         }
                         quic_tx
                             .send(QuicWrite::Data {
                                 stream_id,
                                 data: buf[..read].to_vec(),
-                                fin: false,
+                                fin: remote_closed,
                             })
                             .await
                             .map_err(|_| anyhow::anyhow!("tuic connection closed"))?;
@@ -704,8 +739,8 @@ fn spawn_relay(
 
         if let Err(err) = result {
             debug!(%err, "tuic relay failed");
+            let _ = quic_tx.send(QuicWrite::Close { stream_id }).await;
         }
-        let _ = quic_tx.send(QuicWrite::Close { stream_id }).await;
     });
 }
 

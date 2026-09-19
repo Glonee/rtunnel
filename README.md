@@ -92,6 +92,11 @@ public trusted certificates after testing. HTTP-01 requires the configured
 fails, startup fails; if a cached certificate is still valid, renewal failures
 are logged and retried later.
 
+Certificate caches are separated by the ACME directory URL, so staging and
+production certificates cannot be mixed. Legacy certificate files directly under
+`certificates/<domain>` are not reused; the first startup after upgrading obtains
+a certificate in the directory-specific cache.
+
 ## TLS fingerprinting
 
 TLS is backed by BoringSSL through the `boring` and `tokio-boring` crates. TCP

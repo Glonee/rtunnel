@@ -137,7 +137,11 @@ pub async fn serve(
                             if let Some(stream) = streams.get_mut(&frame.stream_id) {
                                 match stream {
                                     InboundStream::Tcp(stream) => {
-                                        stream.write_all(&frame.data).await?;
+                                        if let Err(err) = stream.write_all(&frame.data).await {
+                                            debug!(%err, stream_id = frame.stream_id, "anytls stream write failed");
+                                            streams.remove(&frame.stream_id);
+                                            write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
+                                        }
                                     }
                                     InboundStream::Udp(tx) => {
                                         let _ = tx.send(frame.data).await;
@@ -146,7 +150,14 @@ pub async fn serve(
                                 continue;
                             }
 
-                            let (target, consumed) = codec::decode_socksaddr(&frame.data)?;
+                            let (target, consumed) = match codec::decode_socksaddr(&frame.data) {
+                                Ok(target) => target,
+                                Err(err) => {
+                                    debug!(%err, stream_id = frame.stream_id, "anytls invalid stream target");
+                                    write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
+                                    continue;
+                                }
+                            };
                             if codec::is_uot_v2_magic_target(&target) {
                                 let (tx, rx) = mpsc::channel(UOT_CHANNEL_CAPACITY);
                                 if consumed < frame.data.len() {
@@ -172,11 +183,22 @@ pub async fn serve(
                                 command: Command::Connect,
                                 target,
                             };
-                            let outbound = router.dial(&session).await?;
+                            let outbound = match router.dial(&session).await {
+                                Ok(outbound) => outbound,
+                                Err(err) => {
+                                    debug!(%err, target = %session.target, "anytls stream dial failed");
+                                    write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
+                                    continue;
+                                }
+                            };
                             debug!(%peer, %username, target = %session.target, "anytls connected");
                             let (read_half, mut write_half) = tokio::io::split(outbound);
-                            if consumed < frame.data.len() {
-                                write_half.write_all(&frame.data[consumed..]).await?;
+                            if consumed < frame.data.len()
+                                && let Err(err) = write_half.write_all(&frame.data[consumed..]).await
+                            {
+                                debug!(%err, stream_id = frame.stream_id, "anytls initial stream write failed");
+                                write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
+                                continue;
                             }
                             streams.insert(frame.stream_id, InboundStream::Tcp(write_half));
                             if client_v2 && synacked_streams.insert(frame.stream_id) {
@@ -416,15 +438,21 @@ async fn run_uot_connect_stream(
     writer: Arc<Mutex<TlsWriteHalf>>,
 ) -> anyhow::Result<()> {
     loop {
-        tokio::select! {
-            payload = input.read_len_payload() => {
-                let payload = payload?;
-                outbound.send_to(&target, &payload).await?;
-            }
-            received = outbound.recv_from() => {
-                let (_source, payload) = received?;
-                let frame = codec::encode_uot_payload(&payload)?;
-                write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+        // Keep the framing read alive while responses are forwarded.
+        let next = input.read_len_payload();
+        tokio::pin!(next);
+        loop {
+            tokio::select! {
+                payload = &mut next => {
+                    let payload = payload?;
+                    outbound.send_to(&target, &payload).await?;
+                    break;
+                }
+                received = outbound.recv_from() => {
+                    let (_source, payload) = received?;
+                    let frame = codec::encode_uot_payload(&payload)?;
+                    write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+                }
             }
         }
     }
@@ -437,15 +465,21 @@ async fn run_uot_packet_stream(
     writer: Arc<Mutex<TlsWriteHalf>>,
 ) -> anyhow::Result<()> {
     loop {
-        tokio::select! {
-            packet = input.read_packet() => {
-                let (target, payload) = packet?;
-                outbound.send_to(&target, &payload).await?;
-            }
-            received = outbound.recv_from() => {
-                let (source, payload) = received?;
-                let frame = codec::encode_uot_packet(&source, &payload)?;
-                write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+        // Keep the framing read alive while responses are forwarded.
+        let next = input.read_packet();
+        tokio::pin!(next);
+        loop {
+            tokio::select! {
+                packet = &mut next => {
+                    let (target, payload) = packet?;
+                    outbound.send_to(&target, &payload).await?;
+                    break;
+                }
+                received = outbound.recv_from() => {
+                    let (source, payload) = received?;
+                    let frame = codec::encode_uot_packet(&source, &payload)?;
+                    write_frame(&writer, codec::CMD_PSH, stream_id, &frame).await?;
+                }
             }
         }
     }

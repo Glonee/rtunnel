@@ -135,6 +135,9 @@ async function runCase(testCase, tmpDir, cert, tcpEcho, udpEcho) {
     await tcpRoundTrip(socksPort, tcpEcho.port, Buffer.from(`${label}:tcp`));
     await udpRoundTrip(socksPort, udpEcho, Buffer.from(`${label}:udp:one`));
     await udpRoundTrip(socksPort, udpEcho, Buffer.from(`${label}:udp:two`));
+    if (testCase.protocol === "tuic") {
+      await udpRoundTrip(socksPort, udpEcho, Buffer.alloc(4096, 0x54));
+    }
   } catch (error) {
     error.message = `${error.message}\nlogs: ${processes.map((p) => p.logPath).join(", ")}`;
     throw error;

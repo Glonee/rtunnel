@@ -154,6 +154,45 @@ pub fn encode_packet(packet: &Packet) -> anyhow::Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Split a complete UDP packet to fit the negotiated QUIC DATAGRAM payload.
+pub fn fragment_packet(packet: &Packet, max_size: usize) -> anyhow::Result<Vec<Packet>> {
+    let encoded = encode_packet(packet)?;
+    if encoded.len() <= max_size {
+        return Ok(vec![packet.clone()]);
+    }
+    anyhow::ensure!(
+        packet.frag_total == 1 && packet.frag_id == 0,
+        "cannot refragment a TUIC fragment"
+    );
+    let header_len = encoded.len() - packet.payload.len();
+    let capacity = max_size
+        .checked_sub(header_len)
+        .filter(|len| *len > 0)
+        .ok_or_else(|| anyhow::anyhow!("QUIC DATAGRAM limit cannot fit a TUIC packet header"))?;
+    let count = packet.payload.len().div_ceil(capacity);
+    anyhow::ensure!(
+        count <= u8::MAX as usize,
+        "TUIC packet requires too many fragments"
+    );
+    Ok(packet
+        .payload
+        .chunks(capacity)
+        .enumerate()
+        .map(|(index, payload)| Packet {
+            assoc_id: packet.assoc_id,
+            pkt_id: packet.pkt_id,
+            frag_total: count as u8,
+            frag_id: index as u8,
+            target: if index == 0 {
+                packet.target.clone()
+            } else {
+                None
+            },
+            payload: payload.to_vec(),
+        })
+        .collect())
+}
+
 pub fn parse_packet(data: &[u8]) -> anyhow::Result<Packet> {
     let (header, payload_start) = parse_header(data)?;
     let Header::Packet(packet) = header else {
@@ -404,6 +443,41 @@ mod tests {
         let decoded = parse_packet(&encoded).unwrap();
 
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn fragments_large_udp_packets_within_negotiated_limit() {
+        for target in [
+            TargetAddr::Ip("127.0.0.1:443".parse().unwrap()),
+            TargetAddr::Ip("[::1]:443".parse().unwrap()),
+            TargetAddr::Domain {
+                host: "a".repeat(255),
+                port: 443,
+            },
+        ] {
+            let packet = Packet {
+                assoc_id: 1,
+                pkt_id: 7,
+                frag_total: 1,
+                frag_id: 0,
+                target: Some(target),
+                payload: vec![42; 60_000],
+            };
+            let fragments = fragment_packet(&packet, 1200).unwrap();
+            assert!(fragments.len() > 1);
+            let mut assembler = PacketAssembler::default();
+            let mut complete = None;
+            for fragment in fragments.into_iter().rev() {
+                let encoded = encode_packet(&fragment).unwrap();
+                assert!(encoded.len() <= 1200);
+                complete = assembler
+                    .push(parse_packet(&encoded).unwrap())
+                    .unwrap()
+                    .or(complete);
+            }
+            assert_eq!(complete, Some(packet.clone()));
+            assert!(fragment_packet(&packet, 1).is_err());
+        }
     }
 
     #[test]

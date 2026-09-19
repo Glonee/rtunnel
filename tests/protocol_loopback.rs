@@ -267,6 +267,102 @@ async fn anytls_outbound_reaches_anytls_inbound() -> anyhow::Result<()> {
     assert_echo_roundtrip(client, echo_addr).await
 }
 
+async fn anytls_frame(
+    stream: &mut SslStream<TcpStream>,
+    command: u8,
+    id: u32,
+) -> anyhow::Result<Vec<u8>> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = anytls_codec::read_frame(stream).await?;
+            if frame.command == command && frame.stream_id == id {
+                return Ok(frame.data);
+            }
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn anytls_failed_destination_preserves_sibling_streams() -> anyhow::Result<()> {
+    let echo = spawn_echo_server().await?;
+    let refused = TcpListener::bind(localhost(0)).await?;
+    let refused_addr = refused.local_addr()?;
+    let (server, ca) = spawn_anytls_inbound().await?;
+    let mut stream = connect_anytls_session(server, &ca).await?;
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SETTINGS, 0, b"v=1").await?;
+    let mut request = anytls_codec::encode_socksaddr(&echo.into())?;
+    request.extend_from_slice(b"ping");
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SYN, 1, &[]).await?;
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, &request).await?;
+    assert_eq!(
+        anytls_frame(&mut stream, anytls_codec::CMD_PSH, 1).await?,
+        b"ping"
+    );
+
+    drop(refused);
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SYN, 2, &[]).await?;
+    anytls_codec::write_frame(
+        &mut stream,
+        anytls_codec::CMD_PSH,
+        2,
+        &anytls_codec::encode_socksaddr(&refused_addr.into())?,
+    )
+    .await?;
+    anytls_frame(&mut stream, anytls_codec::CMD_FIN, 2).await?;
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, b"pong").await?;
+    assert_eq!(
+        anytls_frame(&mut stream, anytls_codec::CMD_PSH, 1).await?,
+        b"pong"
+    );
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SYN, 3, &[]).await?;
+    anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 3, &request).await?;
+    assert_eq!(
+        anytls_frame(&mut stream, anytls_codec::CMD_PSH, 3).await?,
+        b"ping"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn anytls_udp_partial_requests_survive_incoming_responses() -> anyhow::Result<()> {
+    let (server, ca) = spawn_anytls_inbound().await?;
+    for connect in [true, false] {
+        let udp = UdpSocket::bind(localhost(0)).await?;
+        let target = udp.local_addr()?.into();
+        let mut stream = connect_anytls_session(server, &ca).await?;
+        anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SETTINGS, 0, b"v=1").await?;
+        anytls_codec::write_frame(&mut stream, anytls_codec::CMD_SYN, 1, &[]).await?;
+        let encode = |payload: &[u8]| {
+            if connect {
+                anytls_codec::encode_uot_payload(payload)
+            } else {
+                anytls_codec::encode_uot_packet(&target, payload)
+            }
+        };
+        let mut request = anytls_codec::encode_socksaddr(&anytls_codec::uot_v2_magic_target())?;
+        request.push(u8::from(connect));
+        request.extend(anytls_codec::encode_uot_addr(&target)?);
+        request.extend(encode(b"first")?);
+        anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, &request).await?;
+        let mut buf = [0; 1024];
+        let (_, peer) = timeout(Duration::from_secs(2), udp.recv_from(&mut buf)).await??;
+        let next = encode(b"second")?;
+        let split = if connect { 3 } else { 1 };
+        anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, &next[..split]).await?;
+        sleep(Duration::from_millis(20)).await;
+        udp.send_to(b"reply", peer).await?;
+        assert_eq!(
+            anytls_frame(&mut stream, anytls_codec::CMD_PSH, 1).await?,
+            encode(b"reply")?
+        );
+        anytls_codec::write_frame(&mut stream, anytls_codec::CMD_PSH, 1, &next[split..]).await?;
+        let (read, _) = timeout(Duration::from_secs(2), udp.recv_from(&mut buf)).await??;
+        assert_eq!(&buf[..read], b"second");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn anytls_inbound_negotiates_tls13_and_serves_h2_static_fallback() -> anyhow::Result<()> {
     let (inbound_addr, ca_certificate) = spawn_anytls_inbound().await?;
@@ -706,6 +802,118 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
+}
+
+async fn tuic_test_client() -> anyhow::Result<TuicOutbound> {
+    let (server, ca) = spawn_tuic_inbound().await?;
+    TuicOutbound::new(OutboundConfig {
+        tag: "client".into(),
+        protocol: Protocol::Tuic,
+        server: Some(server.into()),
+        server_name: Some("localhost".into()),
+        insecure: false,
+        ca_certificate: Some(ca),
+        username: None,
+        password: Some("secret".into()),
+        uuid: Some(TUIC_UUID.into()),
+        max_streams: None,
+        max_connections: None,
+        connection_idle_timeout: None,
+    })
+}
+
+#[tokio::test]
+async fn tuic_propagates_client_eof_and_drains_response() -> anyhow::Result<()> {
+    let listener = TcpListener::bind(localhost(0)).await?;
+    let target = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await?;
+        assert_eq!(request, b"request");
+        stream.write_all(b"response after EOF").await?;
+        stream.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+    let client = tuic_test_client().await?;
+    let mut stream = client
+        .dial(&Session {
+            inbound: "test".into(),
+            command: Command::Connect,
+            target: target.into(),
+        })
+        .await?;
+    stream.write_all(b"request").await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await??;
+    assert_eq!(response, b"response after EOF");
+    timeout(Duration::from_secs(2), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuic_remote_eof_keeps_client_write_direction_open() -> anyhow::Result<()> {
+    let listener = TcpListener::bind(localhost(0)).await?;
+    let target = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        stream.write_all(b"greeting").await?;
+        stream.shutdown().await?;
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await?;
+        assert_eq!(request, b"sent after remote EOF");
+        Ok::<_, anyhow::Error>(())
+    });
+    let client = tuic_test_client().await?;
+    let mut stream = client
+        .dial(&Session {
+            inbound: "test".into(),
+            command: Command::Connect,
+            target: target.into(),
+        })
+        .await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await??;
+    assert_eq!(response, b"greeting");
+    stream.write_all(b"sent after remote EOF").await?;
+    stream.shutdown().await?;
+    timeout(Duration::from_secs(2), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuic_native_udp_fragments_large_packets_and_keeps_session_usable() -> anyhow::Result<()> {
+    let echo = spawn_udp_echo_server().await?;
+    let client = tuic_test_client().await?;
+    let session = client
+        .dial_udp(&Session {
+            inbound: "test".into(),
+            command: Command::UdpAssociate,
+            target: echo.into(),
+        })
+        .await?;
+    for size in [0, 4096, 8192, 4] {
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        session.send_to(&echo.into(), &payload).await?;
+        let (source, received) = timeout(Duration::from_secs(3), session.recv_from()).await??;
+        assert_eq!(source, echo.into());
+        assert_eq!(received, payload);
+    }
+    assert!(
+        session
+            .send_to(&echo.into(), &vec![0; 65_536])
+            .await
+            .is_err()
+    );
+    session.send_to(&echo.into(), b"still alive").await?;
+    assert_eq!(
+        timeout(Duration::from_secs(2), session.recv_from())
+            .await??
+            .1,
+        b"still alive"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1334,7 +1542,7 @@ async fn spawn_udp_echo_server() -> anyhow::Result<SocketAddr> {
     let socket = UdpSocket::bind(localhost(0)).await?;
     let addr = socket.local_addr()?;
     tokio::spawn(async move {
-        let mut buf = [0; 2048];
+        let mut buf = [0; 64 * 1024];
         loop {
             let Ok((read, peer)) = socket.recv_from(&mut buf).await else {
                 break;
