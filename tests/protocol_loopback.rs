@@ -42,6 +42,143 @@ const TUIC_UUID: &str = "00000000-0000-0000-0000-000000000001";
 const TUIC_AUTH_STREAM_ID: u64 = 2;
 
 #[tokio::test]
+async fn socks5_udp_rejects_unrequested_client_port() -> anyhow::Result<()> {
+    use rtunnel::protocol::socks5::codec as socks_codec;
+    let server = spawn_socks5_inbound(Some(("user", "pass"))).await?;
+    let echo = spawn_udp_echo_server().await?;
+    let client = UdpSocket::bind(localhost(0)).await?;
+    let attacker = UdpSocket::bind(localhost(0)).await?;
+    let (_control, relay) = authenticated_socks_udp_associate(server, client.local_addr()?).await?;
+    let packet = socks_codec::encode_udp_packet(&echo.into(), b"ping")?;
+    attacker.send_to(&packet, relay).await?;
+    let mut buf = [0; 1024];
+    assert!(
+        timeout(Duration::from_millis(100), attacker.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+    client.send_to(&packet, relay).await?;
+    let (read, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await??;
+    assert_eq!(
+        socks_codec::decode_udp_packet(&buf[..read])?,
+        (echo.into(), b"ping".to_vec())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn socks5_udp_learns_port_only_from_valid_packets() -> anyhow::Result<()> {
+    use rtunnel::protocol::socks5::codec as socks_codec;
+    let server = spawn_socks5_inbound(Some(("user", "pass"))).await?;
+    let echo = spawn_udp_echo_server().await?;
+    let attacker = UdpSocket::bind(localhost(0)).await?;
+    let client = UdpSocket::bind(localhost(0)).await?;
+    let (_control, relay) = authenticated_socks_udp_associate(server, "0.0.0.0:0".parse()?).await?;
+    attacker.send_to(&[0], relay).await?;
+    // Give the malformed packet time to reach the relay before the valid one.
+    sleep(Duration::from_millis(20)).await;
+    let packet = socks_codec::encode_udp_packet(&echo.into(), b"ping")?;
+    client.send_to(&packet, relay).await?;
+    let mut buf = [0; 1024];
+    let (read, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf)).await??;
+    assert_eq!(
+        socks_codec::decode_udp_packet(&buf[..read])?,
+        (echo.into(), b"ping".to_vec())
+    );
+    attacker.send_to(&packet, relay).await?;
+    assert!(
+        timeout(Duration::from_millis(100), attacker.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+async fn authenticated_socks_udp_associate(
+    server: SocketAddr,
+    client: SocketAddr,
+) -> anyhow::Result<(TcpStream, SocketAddr)> {
+    use rtunnel::protocol::socks5::codec as socks_codec;
+    let mut control = TcpStream::connect(server).await?;
+    control.write_all(&[5, 1, 2]).await?;
+    let mut reply = [0; 2];
+    control.read_exact(&mut reply).await?;
+    assert_eq!(reply, [5, 2]);
+    control.write_all(b"\x01\x04user\x04pass").await?;
+    control.read_exact(&mut reply).await?;
+    assert_eq!(reply, [1, 0]);
+    control.write_all(&[5, 3, 0]).await?;
+    control
+        .write_all(&socks_codec::encode_addr(&client.into())?)
+        .await?;
+    let mut reply = [0; 10];
+    control.read_exact(&mut reply).await?;
+    assert_eq!(&reply[..3], &[5, 0, 0]);
+    let (TargetAddr::Ip(relay), _) = socks_codec::decode_addr(&reply[3..])? else {
+        anyhow::bail!("test relay returned a domain");
+    };
+    Ok((control, relay))
+}
+
+#[tokio::test]
+async fn tuic_udp_routes_both_modes_through_configured_socks_outbound() -> anyhow::Result<()> {
+    use rtunnel::protocol::socks5::codec as socks_codec;
+    for mode in [TuicTestUdpMode::Native, TuicTestUdpMode::Quic] {
+        let listener = TcpListener::bind(localhost(0)).await?;
+        let proxy_addr = listener.local_addr()?;
+        let proxy = tokio::spawn(async move {
+            let (mut control, _) = listener.accept().await?;
+            let mut greeting = [0; 3];
+            control.read_exact(&mut greeting).await?;
+            anyhow::ensure!(greeting == [5, 1, 0], "unexpected proxy greeting");
+            control.write_all(&[5, 0]).await?;
+            let mut request = [0; 10];
+            control.read_exact(&mut request).await?;
+            anyhow::ensure!(request[..4] == [5, 3, 0, 1], "expected UDP ASSOCIATE");
+            let relay = UdpSocket::bind(localhost(0)).await?;
+            control.write_all(&[5, 0, 0]).await?;
+            control
+                .write_all(&socks_codec::encode_addr(&relay.local_addr()?.into())?)
+                .await?;
+            let mut buf = [0; 1024];
+            let (read, peer) = relay.recv_from(&mut buf).await?;
+            let (target, payload) = socks_codec::decode_udp_packet(&buf[..read])?;
+            anyhow::ensure!(payload == b"ping", "unexpected proxy payload");
+            relay
+                .send_to(&socks_codec::encode_udp_packet(&target, b"routed")?, peer)
+                .await?;
+            // Keep the association alive until the TUIC side receives its reply.
+            let _ = control.read(&mut [0]).await;
+            Ok::<_, anyhow::Error>(())
+        });
+        let cfg: Config = toml::from_str(&format!(
+            r#"
+            [[outbounds]]
+            tag = "direct"
+            protocol = "direct"
+            [[outbounds]]
+            tag = "proxy"
+            protocol = "socks5"
+            server = "{proxy_addr}"
+            [routing]
+            default = "direct"
+            [[routing.rules]]
+            inbound = "tuic-in"
+            outbound = "proxy"
+        "#
+        ))?;
+        let (server, ca) = spawn_tuic_inbound_with_routes(cfg.outbounds, cfg.routing).await?;
+        // A direct route would return "ping", so only the selected proxy can
+        // produce the expected marker in either TUIC UDP relay mode.
+        let echo = spawn_udp_echo_server().await?;
+        let response = tuic_udp_roundtrip(server, echo, &ca, mode).await?;
+        assert_eq!(response, b"routed");
+        proxy.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn socks5_outbound_reaches_socks5_inbound() -> anyhow::Result<()> {
     let echo_addr = spawn_echo_server().await?;
     let inbound_addr = spawn_socks5_inbound(None).await?;
@@ -1061,6 +1198,20 @@ async fn spawn_anytls_reuse_probe_server()
 }
 
 async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
+    let cfg: Config = toml::from_str(
+        r#"
+        [[outbounds]]
+        tag = "direct"
+        protocol = "direct"
+    "#,
+    )?;
+    spawn_tuic_inbound_with_routes(cfg.outbounds, cfg.routing).await
+}
+
+async fn spawn_tuic_inbound_with_routes(
+    outbounds: Vec<OutboundConfig>,
+    routing: RoutingConfig,
+) -> anyhow::Result<(SocketAddr, String)> {
     let socket = UdpSocket::bind(localhost(0)).await?;
     let addr = socket.local_addr()?;
     let tls = write_test_tls_files()?;
@@ -1083,24 +1234,8 @@ async fn spawn_tuic_inbound() -> anyhow::Result<(SocketAddr, String)> {
             log_level: None,
             acme: None,
             inbounds: vec![inbound_cfg.clone()],
-            outbounds: vec![OutboundConfig {
-                tag: "direct".to_owned(),
-                protocol: Protocol::Direct,
-                server: None,
-                server_name: None,
-                insecure: false,
-                ca_certificate: None,
-                username: None,
-                password: None,
-                uuid: None,
-                max_streams: None,
-                max_connections: None,
-                connection_idle_timeout: None,
-            }],
-            routing: RoutingConfig {
-                default: Some("direct".to_owned()),
-                rules: Vec::new(),
-            },
+            outbounds,
+            routing,
         })
         .await?,
     );

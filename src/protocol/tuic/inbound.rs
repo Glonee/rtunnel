@@ -33,6 +33,9 @@ const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const CHANNEL_CAPACITY: usize = 32;
 const UDP_CHANNEL_CAPACITY: usize = 128;
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PRE_AUTH_BYTES: usize = 256 * 1024;
+const MAX_PRE_AUTH_ITEMS: usize = 256;
 
 pub async fn run(cfg: InboundConfig, router: Arc<Router>) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(cfg.listen).await?;
@@ -113,6 +116,9 @@ struct TuicApp {
     router: Arc<Router>,
     users: Vec<TuicUser>,
     authenticated: bool,
+    authentication_deadline: Instant,
+    pre_auth_bytes: usize,
+    pre_auth_items: usize,
     username: Option<String>,
     uni_streams: HashMap<u64, Vec<u8>>,
     pending_uni_commands: Vec<Vec<u8>>,
@@ -183,6 +189,9 @@ impl TuicApp {
             router,
             users,
             authenticated: false,
+            authentication_deadline: Instant::now() + AUTHENTICATION_TIMEOUT,
+            pre_auth_bytes: 0,
+            pre_auth_items: 0,
             username: None,
             uni_streams: HashMap::new(),
             pending_uni_commands: Vec::new(),
@@ -199,7 +208,32 @@ impl TuicApp {
         }
     }
 
+    fn check_authentication_deadline(&self) -> QuicResult<()> {
+        if !self.authenticated && Instant::now() >= self.authentication_deadline {
+            return Err(anyhow::anyhow!("tuic authentication timed out").into());
+        }
+        Ok(())
+    }
+
+    fn reserve_pre_auth(&mut self, bytes: usize, items: usize) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
+        if self.authenticated {
+            return Ok(());
+        }
+        if bytes > MAX_PRE_AUTH_BYTES - self.pre_auth_bytes
+            || items > MAX_PRE_AUTH_ITEMS - self.pre_auth_items
+        {
+            return Err(anyhow::anyhow!("tuic unauthenticated buffer limit exceeded").into());
+        }
+        // Count all retained data, including incomplete uni streams and tiny
+        // commands/empty streams that could otherwise evade the byte limit.
+        self.pre_auth_bytes += bytes;
+        self.pre_auth_items += items;
+        Ok(())
+    }
+
     fn handle_auth_data(&mut self, qconn: &mut QuicheConnection, data: &[u8]) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
         let (uuid, presented) = codec::parse_authenticate(data)?;
         let Some(user) = self.users.iter().find(|user| user.uuid == uuid) else {
             return Err(anyhow::anyhow!("tuic authentication: unknown uuid {uuid}").into());
@@ -209,12 +243,14 @@ impl TuicApp {
             return Err(anyhow::anyhow!("tuic authentication: token mismatch").into());
         }
         self.authenticated = true;
+        self.pre_auth_bytes = 0;
+        self.pre_auth_items = 0;
         self.username = Some(user.name.clone());
         debug!(username = %user.name, "tuic authenticated");
 
         let pending_uni_commands = std::mem::take(&mut self.pending_uni_commands);
         for command in pending_uni_commands {
-            self.handle_unidirectional_command(qconn, &command)?;
+            self.handle_unidirectional_command(qconn, command)?;
         }
         let pending_datagrams = std::mem::take(&mut self.pending_datagrams);
         for datagram in pending_datagrams {
@@ -236,6 +272,10 @@ impl TuicApp {
         data: &[u8],
         fin: bool,
     ) -> QuicResult<()> {
+        self.reserve_pre_auth(
+            data.len(),
+            usize::from(!self.uni_streams.contains_key(&stream_id)),
+        )?;
         self.uni_streams
             .entry(stream_id)
             .or_default()
@@ -246,30 +286,30 @@ impl TuicApp {
         let Some(command) = self.uni_streams.remove(&stream_id) else {
             return Ok(());
         };
-        self.handle_unidirectional_command(qconn, &command)
+        self.handle_unidirectional_command(qconn, command)
     }
 
     fn handle_unidirectional_command(
         &mut self,
         qconn: &mut QuicheConnection,
-        data: &[u8],
+        data: Vec<u8>,
     ) -> QuicResult<()> {
         if data.len() < 2 {
             return Err(anyhow::anyhow!("short tuic command").into());
         }
         match data[1] {
-            codec::CMD_AUTHENTICATE => self.handle_auth_data(qconn, data),
+            codec::CMD_AUTHENTICATE => self.handle_auth_data(qconn, &data),
             codec::CMD_PACKET if !self.authenticated => {
-                self.pending_uni_commands.push(data.to_vec());
+                self.pending_uni_commands.push(data);
                 Ok(())
             }
-            codec::CMD_PACKET => self.handle_packet(data, UdpMode::Quic),
+            codec::CMD_PACKET => self.handle_packet(&data, UdpMode::Quic),
             codec::CMD_DISSOCIATE if !self.authenticated => {
-                self.pending_uni_commands.push(data.to_vec());
+                self.pending_uni_commands.push(data);
                 Ok(())
             }
             codec::CMD_DISSOCIATE => {
-                let assoc_id = codec::parse_dissociate(data)?;
+                let assoc_id = codec::parse_dissociate(&data)?;
                 self.udp_sessions.remove(&assoc_id);
                 Ok(())
             }
@@ -279,6 +319,10 @@ impl TuicApp {
 
     fn handle_stream_data(&mut self, stream_id: u64, data: &[u8], fin: bool) -> QuicResult<()> {
         if !self.authenticated {
+            self.reserve_pre_auth(
+                data.len(),
+                usize::from(!self.pending_streams.contains_key(&stream_id)),
+            )?;
             let pending = self.pending_streams.entry(stream_id).or_default();
             pending.data.extend_from_slice(data);
             pending.fin |= fin;
@@ -327,12 +371,14 @@ impl TuicApp {
     }
 
     fn handle_datagram(&mut self, data: &[u8]) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
         if data.len() < 2 {
             return Err(anyhow::anyhow!("short tuic datagram").into());
         }
         match data[1] {
             codec::CMD_HEARTBEAT => Ok(()),
             codec::CMD_PACKET if !self.authenticated => {
+                self.reserve_pre_auth(data.len(), 1)?;
                 self.pending_datagrams.push(data.to_vec());
                 Ok(())
             }
@@ -356,7 +402,14 @@ impl TuicApp {
                 "tuic udp packet received"
             );
             let session = self.udp_sessions.entry(packet.assoc_id).or_insert_with(|| {
-                spawn_udp_session(packet.assoc_id, mode, self.outbound_tx.clone(), now)
+                spawn_udp_session(
+                    self.router.clone(),
+                    self.inbound.clone(),
+                    packet.assoc_id,
+                    mode,
+                    self.outbound_tx.clone(),
+                    now,
+                )
             });
             if session.mode != mode {
                 return Err(anyhow::anyhow!("tuic udp relay mode changed").into());
@@ -410,6 +463,7 @@ impl ApplicationOverQuic for TuicApp {
         _qconn: &mut QuicheConnection,
         _handshake_info: &HandshakeInfo,
     ) -> QuicResult<()> {
+        self.authentication_deadline = Instant::now() + AUTHENTICATION_TIMEOUT;
         Ok(())
     }
 
@@ -418,7 +472,13 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
         self.maybe_cleanup_udp_state();
+        let wake_at = if self.authenticated {
+            self.next_udp_cleanup
+        } else {
+            self.next_udp_cleanup.min(self.authentication_deadline)
+        };
         if self.pending_writes.is_empty() {
             tokio::select! {
                 write = self.outbound_rx.recv() => {
@@ -426,13 +486,14 @@ impl ApplicationOverQuic for TuicApp {
                         self.pending_writes.push_back(write);
                     }
                 }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.next_udp_cleanup)) => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
             }
         }
-        Ok(())
+        self.check_authentication_deadline()
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
         self.maybe_cleanup_udp_state();
         while let Some(stream_id) = qconn.stream_readable_next() {
             loop {
@@ -467,6 +528,7 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.check_authentication_deadline()?;
         self.maybe_cleanup_udp_state();
         while let Ok(write) = self.outbound_rx.try_recv() {
             self.pending_writes.push_back(write);
@@ -614,6 +676,8 @@ fn spawn_relay(
 }
 
 fn spawn_udp_session(
+    router: Arc<Router>,
+    inbound: String,
     assoc_id: u16,
     mode: UdpMode,
     quic_tx: mpsc::Sender<QuicWrite>,
@@ -621,7 +685,7 @@ fn spawn_udp_session(
 ) -> UdpSession {
     let (tx, rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        if let Err(err) = run_udp_session(assoc_id, mode, rx, quic_tx).await {
+        if let Err(err) = run_udp_session(router, inbound, assoc_id, mode, rx, quic_tx).await {
             debug!(%err, %assoc_id, "tuic udp relay failed");
         }
     });
@@ -633,6 +697,8 @@ fn spawn_udp_session(
 }
 
 async fn run_udp_session(
+    router: Arc<Router>,
+    inbound: String,
     assoc_id: u16,
     mode: UdpMode,
     mut rx: mpsc::Receiver<UdpRequest>,
@@ -641,10 +707,14 @@ async fn run_udp_session(
     let Some(first) = rx.recv().await else {
         return Ok(());
     };
-    let socket = UdpSocket::bind(bind_addr_for_target(&first.target)).await?;
-    send_udp_request(&socket, first).await?;
+    let session = Session {
+        inbound,
+        command: Command::UdpAssociate,
+        target: first.target.clone(),
+    };
+    let outbound = router.dial_udp(&session).await?;
+    outbound.send_to(&first.target, &first.payload).await?;
     let mut pkt_id = 0u16;
-    let mut buf = [0; 64 * 1024];
 
     loop {
         tokio::select! {
@@ -652,25 +722,25 @@ async fn run_udp_session(
                 let Some(request) = request else {
                     break;
                 };
-                send_udp_request(&socket, request).await?;
+                outbound.send_to(&request.target, &request.payload).await?;
             }
-            received = socket.recv_from(&mut buf) => {
-                let (read, source) = received?;
+            received = outbound.recv_from() => {
+                let (source, payload) = received?;
+                debug!(
+                    assoc_id,
+                    mode = ?mode,
+                    source = %source,
+                    payload_len = payload.len(),
+                    "tuic udp packet sending response"
+                );
                 let packet = codec::Packet {
                     assoc_id,
                     pkt_id,
                     frag_total: 1,
                     frag_id: 0,
-                    target: Some(TargetAddr::Ip(source)),
-                    payload: buf[..read].to_vec(),
+                    target: Some(source),
+                    payload,
                 };
-                debug!(
-                    assoc_id,
-                    mode = ?mode,
-                    source = %source,
-                    payload_len = read,
-                    "tuic udp packet sending response"
-                );
                 let encoded = codec::encode_packet(&packet)?;
                 let write = match mode {
                     UdpMode::Native => QuicWrite::Datagram {
@@ -683,7 +753,9 @@ async fn run_udp_session(
                         data: encoded,
                     },
                 };
-                let _ = quic_tx.send(write).await;
+                if quic_tx.send(write).await.is_err() {
+                    break;
+                }
                 pkt_id = pkt_id.wrapping_add(1);
             }
         }
@@ -691,27 +763,188 @@ async fn run_udp_session(
     Ok(())
 }
 
-async fn send_udp_request(socket: &UdpSocket, request: UdpRequest) -> anyhow::Result<()> {
-    match request.target {
-        TargetAddr::Ip(addr) => {
-            socket.send_to(&request.payload, addr).await?;
-        }
-        TargetAddr::Domain { host, port } => {
-            socket
-                .send_to(&request.payload, (host.as_str(), port))
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-fn bind_addr_for_target(target: &TargetAddr) -> &'static str {
-    match target {
-        TargetAddr::Ip(addr) if addr.is_ipv6() => "[::]:0",
-        _ => "0.0.0.0:0",
-    }
-}
-
 fn is_unidirectional(stream_id: u64) -> bool {
     stream_id & 0x02 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    async fn test_app() -> TuicApp {
+        let cfg = toml::from_str::<Config>("").unwrap();
+        TuicApp::new(
+            "tuic-in".into(),
+            Arc::new(Router::new(cfg).await.unwrap()),
+            vec![],
+        )
+    }
+
+    fn test_connection() -> QuicheConnection {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        quiche::connect_with_buffer_factory(
+            None,
+            &quiche::ConnectionId::from_ref(&[1; 16]),
+            "127.0.0.1:10000".parse().unwrap(),
+            "127.0.0.1:10001".parse().unwrap(),
+            &mut config,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_excessive_unauthenticated_tcp_data_before_buffering() {
+        let mut app = test_app().await;
+        let chunk = [0; 16 * 1024];
+        for _ in 0..MAX_PRE_AUTH_BYTES / chunk.len() {
+            app.handle_stream_data(0, &chunk, false).unwrap();
+        }
+        assert!(app.handle_stream_data(0, &[0], false).is_err());
+        assert_eq!(app.pending_streams[&0].data.len(), MAX_PRE_AUTH_BYTES);
+    }
+
+    #[tokio::test]
+    async fn bounds_incomplete_unauthenticated_uni_streams() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        app.handle_unidirectional_stream(&mut qconn, 2, &vec![0; MAX_PRE_AUTH_BYTES], false)
+            .unwrap();
+        assert!(
+            app.handle_unidirectional_stream(&mut qconn, 2, &[0], false)
+                .is_err()
+        );
+        assert_eq!(app.uni_streams[&2].len(), MAX_PRE_AUTH_BYTES);
+    }
+
+    #[tokio::test]
+    async fn shares_pre_auth_byte_limit_across_tcp_uni_commands_and_datagrams() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        app.handle_stream_data(0, &vec![0; MAX_PRE_AUTH_BYTES / 2], false)
+            .unwrap();
+        let mut command = vec![0; MAX_PRE_AUTH_BYTES / 2];
+        command[..2].copy_from_slice(&[codec::VERSION, codec::CMD_PACKET]);
+        app.handle_unidirectional_stream(&mut qconn, 2, &command, true)
+            .unwrap();
+        assert_eq!(app.pending_uni_commands.len(), 1);
+        assert!(app.uni_streams.is_empty());
+        // Completing a uni stream must not release its budget while the
+        // command is still retained for authentication.
+        assert!(
+            app.handle_datagram(&[codec::VERSION, codec::CMD_PACKET])
+                .is_err()
+        );
+        assert!(app.pending_datagrams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounds_empty_streams_and_shares_item_limit_with_datagrams() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        for id in 0..MAX_PRE_AUTH_ITEMS as u64 {
+            app.handle_stream_data(id * 4, &[], true).unwrap();
+        }
+        assert!(
+            app.handle_unidirectional_stream(&mut qconn, 2, &[], false)
+                .is_err()
+        );
+        assert!(
+            app.handle_datagram(&[codec::VERSION, codec::CMD_PACKET])
+                .is_err()
+        );
+        assert_eq!(app.pending_streams.len(), MAX_PRE_AUTH_ITEMS);
+        assert!(app.uni_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounds_many_small_unauthenticated_datagrams() {
+        let mut app = test_app().await;
+        for _ in 0..MAX_PRE_AUTH_ITEMS {
+            app.handle_datagram(&[codec::VERSION, codec::CMD_PACKET])
+                .unwrap();
+        }
+        assert!(
+            app.handle_datagram(&[codec::VERSION, codec::CMD_PACKET])
+                .is_err()
+        );
+        assert_eq!(app.pending_datagrams.len(), MAX_PRE_AUTH_ITEMS);
+    }
+
+    #[tokio::test]
+    async fn authentication_deadline_wakes_idle_connections_and_rejects_active_ones() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        app.authentication_deadline = Instant::now() + Duration::from_millis(20);
+        let result = tokio::time::timeout(Duration::from_secs(1), app.wait_for_data(&mut qconn))
+            .await
+            .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("authentication timed out")
+        );
+        assert!(app.process_reads(&mut qconn).is_err());
+        assert!(app.process_writes(&mut qconn).is_err());
+        assert!(
+            app.handle_datagram(&[codec::VERSION, codec::CMD_HEARTBEAT])
+                .is_err()
+        );
+        assert!(app.handle_stream_data(0, b"late", false).is_err());
+        assert!(app.pending_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_connections_are_not_subject_to_authentication_deadline() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        app.authenticated = true;
+        app.authentication_deadline = Instant::now() - Duration::from_secs(1);
+        app.handle_datagram(&[codec::VERSION, codec::CMD_HEARTBEAT])
+            .unwrap();
+        app.process_reads(&mut qconn).unwrap();
+        app.process_writes(&mut qconn).unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_route_failure_never_falls_back_to_direct() {
+        // A matching rule must fail closed, even with a working direct default.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[outbounds]]
+            tag = "direct"
+            protocol = "direct"
+            [routing]
+            default = "direct"
+            [[routing.rules]]
+            inbound = "tuic-in"
+            outbound = "missing"
+        "#,
+        )
+        .unwrap();
+        let router = Arc::new(Router::new(cfg).await.unwrap());
+        for mode in [UdpMode::Native, UdpMode::Quic] {
+            let (tx, rx) = mpsc::channel(1);
+            let (quic_tx, _quic_rx) = mpsc::channel(1);
+            tx.send(UdpRequest {
+                target: "127.0.0.1:9"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+                payload: b"must not escape directly".to_vec(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let result =
+                run_udp_session(router.clone(), "tuic-in".into(), 1, mode, rx, quic_tx).await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown outbound missing")
+            );
+        }
+    }
 }

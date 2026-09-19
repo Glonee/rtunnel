@@ -34,6 +34,16 @@ cargo run -- -c examples/socks.toml
 
 Then point a SOCKS5 client at `127.0.0.1:1080`.
 
+SOCKS5 UDP associations accept packets only from the TCP client's IP. A nonzero
+client port in the UDP ASSOCIATE request is enforced; otherwise the first valid
+packet selects the UDP port for the association.
+
+TUIC UDP uses the configured routing rules in both native and QUIC stream modes.
+TUIC clients must authenticate within 10 seconds of completing the QUIC handshake.
+Before authentication, each connection may retain at most 256 KiB of incoming
+data and 256 pending streams/datagrams in total; exceeding either limit closes
+the connection.
+
 Outbound `server` values accept either an IP socket address such as
 `127.0.0.1:8443` or a domain endpoint such as `proxy.example.com:8443`.
 
