@@ -25,7 +25,7 @@ use rtunnel::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{sleep, timeout},
 };
 use tokio_boring::{SslStream, SslStreamBuilder, accept};
@@ -706,6 +706,67 @@ async fn tuic_outbound_reaches_tuic_inbound() -> anyhow::Result<()> {
     })?;
 
     assert_echo_roundtrip(client, echo_addr).await
+}
+
+#[tokio::test]
+async fn tuic_accepts_fragmented_authentication_with_or_without_fin() -> anyhow::Result<()> {
+    let echo = spawn_echo_server().await?;
+    let (server, ca) = spawn_tuic_inbound().await?;
+    for auth_fin in [true, false] {
+        let mut client = TuicFramingClient::connect(server, &ca).await?;
+        client.send(2, client.auth[..1].to_vec(), false)?;
+        sleep(Duration::from_millis(20)).await;
+        client.send(2, client.auth[1..].to_vec(), auth_fin)?;
+        client.send(0, codec::encode_connect(&echo.into(), b"ping")?, false)?;
+        client.expect(0, b"ping").await?;
+
+        if !auth_fin {
+            // A delayed, empty FIN must not be parsed as a second command.
+            client.send(2, vec![], true)?;
+        }
+        client.send(0, b"pong".to_vec(), false)?;
+        client.expect(0, b"pong").await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuic_buffers_connect_header_across_authentication() -> anyhow::Result<()> {
+    let echo = spawn_echo_server().await?;
+    let (server, ca) = spawn_tuic_inbound().await?;
+    let mut client = TuicFramingClient::connect(server, &ca).await?;
+    let connect = codec::encode_connect(&echo.into(), b"ping")?;
+    client.send(2, client.auth[..1].to_vec(), false)?;
+    client.send(0, connect[..2].to_vec(), false)?;
+    sleep(Duration::from_millis(20)).await;
+    client.send(2, client.auth[1..].to_vec(), true)?;
+    // A second relay confirms authentication completed while the first
+    // CONNECT header was still incomplete.
+    client.send(4, connect.clone(), false)?;
+    client.expect(4, b"ping").await?;
+    client.send(0, connect[2..].to_vec(), false)?;
+    client.expect(0, b"ping").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuic_buffers_connect_header_after_authentication() -> anyhow::Result<()> {
+    let echo = spawn_echo_server().await?;
+    let (server, ca) = spawn_tuic_inbound().await?;
+    let mut client = TuicFramingClient::connect(server, &ca).await?;
+    let connect = codec::encode_connect(&echo.into(), b"ping")?;
+    client.send(2, client.auth.clone(), true)?;
+    client.send(0, connect.clone(), false)?;
+    client.expect(0, b"ping").await?;
+
+    client.send(4, connect[..2].to_vec(), false)?;
+    sleep(Duration::from_millis(20)).await;
+    client.send(4, connect[2..].to_vec(), false)?;
+    client.expect(4, b"ping").await?;
+    // Fragmenting a new header must also leave existing relays usable.
+    client.send(0, b"pong".to_vec(), false)?;
+    client.expect(0, b"pong").await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1487,6 +1548,154 @@ impl ApplicationOverQuic for TuicUdpClientApp {
     }
 }
 
+struct TuicFramingWrite {
+    stream_id: u64,
+    data: Vec<u8>,
+    fin: bool,
+}
+
+struct TuicFramingClient {
+    auth: Vec<u8>,
+    writes: mpsc::UnboundedSender<TuicFramingWrite>,
+    responses: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+}
+
+impl TuicFramingClient {
+    async fn connect(server: SocketAddr, ca: &str) -> anyhow::Result<Self> {
+        let socket = UdpSocket::bind(localhost(0)).await?;
+        socket.connect(server).await?;
+        let mut settings = QuicSettings::default();
+        settings.alpn = vec![b"h3".to_vec()];
+        settings.verify_peer = true;
+        let params =
+            ConnectionParams::new_client(settings, None, tls::chrome_quic_client_hooks(Some(ca)));
+        let (writes, write_rx) = mpsc::unbounded_channel();
+        let (response_tx, responses) = mpsc::unbounded_channel();
+        let (auth_tx, auth_rx) = oneshot::channel();
+        let app = TuicFramingApp {
+            auth_tx: Some(auth_tx),
+            write_rx,
+            response_tx,
+            pending: VecDeque::new(),
+        };
+        connect_with_config(Socket::try_from(socket)?, Some("localhost"), &params, app)
+            .await
+            .map_err(|err| anyhow::anyhow!("tuic framing test handshake failed: {err}"))?;
+        Ok(Self {
+            auth: timeout(Duration::from_secs(5), auth_rx).await??,
+            writes,
+            responses,
+        })
+    }
+
+    fn send(&self, stream_id: u64, data: Vec<u8>, fin: bool) -> anyhow::Result<()> {
+        self.writes.send(TuicFramingWrite {
+            stream_id,
+            data,
+            fin,
+        })?;
+        Ok(())
+    }
+
+    async fn expect(&mut self, stream_id: u64, expected: &[u8]) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            while response.len() < expected.len() {
+                let (id, data) = self
+                    .responses
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("tuic framing test connection closed"))?;
+                anyhow::ensure!(id == stream_id, "unexpected response stream {id}");
+                response.extend_from_slice(&data);
+            }
+            anyhow::ensure!(response == expected, "unexpected response {response:?}");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+}
+
+struct TuicFramingApp {
+    auth_tx: Option<oneshot::Sender<Vec<u8>>>,
+    write_rx: mpsc::UnboundedReceiver<TuicFramingWrite>,
+    response_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    pending: VecDeque<TuicFramingWrite>,
+}
+
+impl ApplicationOverQuic for TuicFramingApp {
+    fn on_conn_established(
+        &mut self,
+        qconn: &mut QuicheConnection,
+        _: &HandshakeInfo,
+    ) -> QuicResult<()> {
+        let uuid = Uuid::parse_str(TUIC_UUID)?;
+        let auth = codec::encode_authenticate(uuid, codec::token(qconn.as_mut(), uuid, "secret")?)?;
+        if let Some(tx) = self.auth_tx.take() {
+            let _ = tx.send(auth);
+        }
+        Ok(())
+    }
+
+    fn should_act(&self) -> bool {
+        true
+    }
+
+    async fn wait_for_data(&mut self, _: &mut QuicheConnection) -> QuicResult<()> {
+        if self.pending.is_empty() {
+            if let Some(write) = self.write_rx.recv().await {
+                self.pending.push_back(write);
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        while let Some(stream_id) = qconn.stream_readable_next() {
+            let mut buf = [0; 1024];
+            loop {
+                match qconn.stream_recv(stream_id, &mut buf) {
+                    Ok((read, fin)) => {
+                        if read > 0 {
+                            let _ = self.response_tx.send((stream_id, buf[..read].to_vec()));
+                        }
+                        if fin {
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(err) => return Err(Box::new(err)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        while let Ok(write) = self.write_rx.try_recv() {
+            self.pending.push_back(write);
+        }
+        while let Some(mut write) = self.pending.pop_front() {
+            match qconn.stream_send(write.stream_id, &write.data, write.fin) {
+                Ok(sent) if sent == write.data.len() => {}
+                Ok(sent) => {
+                    write.data.drain(..sent);
+                    self.pending.push_front(write);
+                    break;
+                }
+                Err(quiche::Error::Done) => {
+                    self.pending.push_front(write);
+                    break;
+                }
+                Err(err) => return Err(Box::new(err)),
+            }
+        }
+        Ok(())
+    }
+}
+
 fn localhost(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
@@ -1497,13 +1706,9 @@ struct TestTlsFiles {
 }
 
 fn write_test_tls_files() -> anyhow::Result<TestTlsFiles> {
-    let suffix = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    );
+    // Concurrent tests can observe the same clock tick and overwrite each
+    // other's CA/key files when the filename only contains a timestamp.
+    let suffix = format!("{}-{}", std::process::id(), Uuid::new_v4());
     let cert = std::env::temp_dir().join(format!("rtunnel-{suffix}.crt"));
     let key = std::env::temp_dir().join(format!("rtunnel-{suffix}.key"));
     let ca = std::env::temp_dir().join(format!("rtunnel-{suffix}-ca.crt"));

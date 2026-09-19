@@ -120,7 +120,7 @@ struct TuicApp {
     pre_auth_bytes: usize,
     pre_auth_items: usize,
     username: Option<String>,
-    uni_streams: HashMap<u64, Vec<u8>>,
+    uni_streams: HashMap<u64, UniStreamState>,
     pending_uni_commands: Vec<Vec<u8>>,
     pending_datagrams: Vec<Vec<u8>>,
     pending_streams: HashMap<u64, PendingStream>,
@@ -136,6 +136,12 @@ struct TuicApp {
 
 struct StreamState {
     client_tx: mpsc::Sender<Vec<u8>>,
+}
+
+enum UniStreamState {
+    Receiving(Vec<u8>),
+    // Authentication has a fixed-size header; a later FIN is only stream cleanup.
+    Authenticated,
 }
 
 #[derive(Default)]
@@ -276,16 +282,35 @@ impl TuicApp {
             data.len(),
             usize::from(!self.uni_streams.contains_key(&stream_id)),
         )?;
-        self.uni_streams
+        let state = self
+            .uni_streams
             .entry(stream_id)
-            .or_default()
-            .extend_from_slice(data);
-        if !fin {
-            return Ok(());
-        }
-        let Some(command) = self.uni_streams.remove(&stream_id) else {
+            .or_insert_with(|| UniStreamState::Receiving(Vec::new()));
+        let UniStreamState::Receiving(command) = state else {
+            if !data.is_empty() {
+                return Err(anyhow::anyhow!("unexpected data after tuic authentication").into());
+            }
+            if fin {
+                self.uni_streams.remove(&stream_id);
+            }
             return Ok(());
         };
+        command.extend_from_slice(data);
+        let auth_complete =
+            command.len() >= codec::AUTHENTICATE_LEN && command[1] == codec::CMD_AUTHENTICATE;
+        if auth_complete && command.len() != codec::AUTHENTICATE_LEN {
+            return Err(anyhow::anyhow!("unexpected data after tuic authentication").into());
+        }
+        if !fin && !auth_complete {
+            return Ok(());
+        }
+        let Some(UniStreamState::Receiving(command)) = self.uni_streams.remove(&stream_id) else {
+            return Ok(());
+        };
+        if !fin {
+            self.uni_streams
+                .insert(stream_id, UniStreamState::Authenticated);
+        }
         self.handle_unidirectional_command(qconn, command)
     }
 
@@ -343,15 +368,24 @@ impl TuicApp {
             return Ok(());
         }
 
-        let (target, consumed) = codec::parse_connect(data)?;
-        let initial = data[consumed..].to_vec();
+        let mut pending = self.pending_streams.remove(&stream_id).unwrap_or_default();
+        pending.data.extend_from_slice(data);
+        pending.fin |= fin;
+        let Some((target, consumed)) = codec::try_parse_connect(&pending.data)? else {
+            if pending.fin {
+                return Err(anyhow::anyhow!("truncated tuic connect header").into());
+            }
+            self.pending_streams.insert(stream_id, pending);
+            return Ok(());
+        };
+        let initial = pending.data[consumed..].to_vec();
         let session = Session {
             inbound: self.inbound.clone(),
             command: Command::Connect,
             target,
         };
         let (client_tx, client_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        if !fin {
+        if !pending.fin {
             self.streams.insert(stream_id, StreamState { client_tx });
         }
         debug!(
@@ -794,6 +828,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_connect_header_truncated_by_fin() {
+        let mut app = test_app().await;
+        app.authenticated = true;
+        app.handle_stream_data(0, &[codec::VERSION, codec::CMD_CONNECT], false)
+            .unwrap();
+        assert!(
+            app.handle_stream_data(0, &[], true)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated tuic connect header")
+        );
+        assert!(app.pending_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_connect_without_waiting_for_fin() {
+        let mut app = test_app().await;
+        app.authenticated = true;
+        assert!(app.handle_stream_data(0, &[0], false).is_err());
+        assert!(app.pending_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validates_fragmented_authentication_without_fin() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        let command =
+            codec::encode_authenticate(Uuid::from_u128(1), [0; codec::TOKEN_LEN]).unwrap();
+        for byte in &command[..command.len() - 1] {
+            app.handle_unidirectional_stream(&mut qconn, 2, &[*byte], false)
+                .unwrap();
+        }
+        // Unknown credentials must fail as soon as the header is complete.
+        assert!(
+            app.handle_unidirectional_stream(&mut qconn, 2, &command[command.len() - 1..], false)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown uuid")
+        );
+        assert!(!app.authenticated);
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_authentication_and_trailing_data() {
+        let mut app = test_app().await;
+        let mut qconn = test_connection();
+        assert!(
+            app.handle_unidirectional_stream(
+                &mut qconn,
+                2,
+                &[codec::VERSION, codec::CMD_AUTHENTICATE],
+                true
+            )
+            .is_err()
+        );
+
+        app.authenticated = true;
+        app.uni_streams.insert(6, UniStreamState::Authenticated);
+        assert!(
+            app.handle_unidirectional_stream(&mut qconn, 6, b"extra", false)
+                .is_err()
+        );
+
+        app.uni_streams.insert(10, UniStreamState::Authenticated);
+        app.handle_unidirectional_stream(&mut qconn, 10, &[], true)
+            .unwrap();
+        assert!(!app.uni_streams.contains_key(&10));
+    }
+
+    #[tokio::test]
     async fn rejects_excessive_unauthenticated_tcp_data_before_buffering() {
         let mut app = test_app().await;
         let chunk = [0; 16 * 1024];
@@ -808,13 +912,18 @@ mod tests {
     async fn bounds_incomplete_unauthenticated_uni_streams() {
         let mut app = test_app().await;
         let mut qconn = test_connection();
-        app.handle_unidirectional_stream(&mut qconn, 2, &vec![0; MAX_PRE_AUTH_BYTES], false)
+        let mut command = vec![0; MAX_PRE_AUTH_BYTES];
+        command[..2].copy_from_slice(&[codec::VERSION, codec::CMD_PACKET]);
+        app.handle_unidirectional_stream(&mut qconn, 2, &command, false)
             .unwrap();
         assert!(
             app.handle_unidirectional_stream(&mut qconn, 2, &[0], false)
                 .is_err()
         );
-        assert_eq!(app.uni_streams[&2].len(), MAX_PRE_AUTH_BYTES);
+        assert!(matches!(
+            &app.uni_streams[&2],
+            UniStreamState::Receiving(data) if data.len() == MAX_PRE_AUTH_BYTES
+        ));
     }
 
     #[tokio::test]

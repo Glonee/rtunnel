@@ -2,11 +2,12 @@ use boring::ssl::SslRef;
 use foreign_types::ForeignTypeRef;
 use std::{
     collections::BTreeMap,
-    io::Cursor,
+    io::{Cursor, ErrorKind},
     time::{Duration, Instant},
 };
 use tuic_core::{
     Address, Authenticate, Connect, Dissociate, Header, Heartbeat, Packet as CorePacket,
+    UnmarshalError,
 };
 use uuid::Uuid;
 
@@ -74,6 +75,22 @@ pub fn parse_connect(data: &[u8]) -> anyhow::Result<(TargetAddr, usize)> {
         );
     };
     Ok((address_to_target(connect.addr())?, consumed))
+}
+
+/// Parse a stream prefix, distinguishing an incomplete header from invalid data.
+pub fn try_parse_connect(data: &[u8]) -> anyhow::Result<Option<(TargetAddr, usize)>> {
+    match parse_connect(data) {
+        Ok(connect) => Ok(Some(connect)),
+        Err(err)
+            if matches!(
+                err.downcast_ref::<UnmarshalError>(),
+                Some(UnmarshalError::Io(io)) if io.kind() == ErrorKind::UnexpectedEof
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn encode_addr(target: &TargetAddr) -> anyhow::Result<Vec<u8>> {
@@ -333,6 +350,43 @@ mod tests {
 
         assert_eq!(target.to_string(), "127.0.0.1:19000");
         assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn connect_prefix_accepts_every_header_split_and_preserves_payload() {
+        let targets = [
+            TargetAddr::Ip("127.0.0.1:443".parse().unwrap()),
+            TargetAddr::Ip("[::1]:443".parse().unwrap()),
+            TargetAddr::Domain {
+                host: "a".repeat(255),
+                port: 443,
+            },
+        ];
+        for target in targets {
+            let header = encode_connect(&target, &[]).unwrap();
+            for split in 0..header.len() {
+                assert!(try_parse_connect(&header[..split]).unwrap().is_none());
+            }
+            let command = encode_connect(&target, b"payload").unwrap();
+            assert_eq!(
+                try_parse_connect(&command).unwrap(),
+                Some((target, header.len()))
+            );
+        }
+    }
+
+    #[test]
+    fn connect_prefix_rejects_invalid_headers() {
+        for data in [
+            vec![0],
+            vec![VERSION, 0xff],
+            vec![VERSION, CMD_HEARTBEAT],
+            vec![VERSION, CMD_CONNECT, 0xfe],
+            vec![VERSION, CMD_CONNECT, 0xff],
+            vec![VERSION, CMD_CONNECT, 0x00, 1, 0xff, 0, 80],
+        ] {
+            assert!(try_parse_connect(&data).is_err(), "accepted {data:?}");
+        }
     }
 
     #[test]
