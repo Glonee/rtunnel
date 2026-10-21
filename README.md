@@ -5,6 +5,8 @@
 
 **WIP! Use at your own risk!**
 
+*The vast majority of the code, tests, and documentation were written by AI. Humans direct architecture, priorities, and design decisions, but have not reviewed most of the code line-by-line. Treat this accordingly — there will be bugs, rough edges, and things that don't work. Use at your own risk.*
+
 `rtunnel` is a Rust sing-box-like proxy with protocol-specific inbound and
 outbound implementations.
 
