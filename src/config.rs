@@ -37,10 +37,10 @@ impl Config {
         if self.outbounds.is_empty() {
             bail!("at least one outbound is required");
         }
-        if let Some(default) = &self.routing.default {
-            if !self.outbounds.iter().any(|out| out.tag == *default) {
-                bail!("routing.default references unknown outbound tag {default}");
-            }
+        if let Some(default) = &self.routing.default
+            && !self.outbounds.iter().any(|out| out.tag == *default)
+        {
+            bail!("routing.default references unknown outbound tag {default}");
         }
         for inbound in &self.inbounds {
             if let Some(tls) = &inbound.tls {

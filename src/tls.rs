@@ -107,7 +107,6 @@ pub fn chrome_quic_client_hooks(ca_certificate: Option<&str>) -> Hooks {
         connection_hook: Some(Arc::new(ChromeQuicClientHook {
             ca_certificate: ca_certificate.map(str::to_owned),
         })),
-        ..Hooks::default()
     }
 }
 
@@ -175,7 +174,6 @@ pub fn quic_hooks(tls: &TlsServerConfig) -> anyhow::Result<Hooks> {
             cert_path: tls.certificate_path()?.to_owned(),
             key_path: tls.private_key_path()?.to_owned(),
         })),
-        ..Hooks::default()
     })
 }
 

@@ -15,8 +15,10 @@ pub type BoxStream = Box<dyn ProxyStream>;
 
 #[async_trait]
 pub trait ProxyDatagram: Send + Sync {
+    #[must_use = "futures do nothing unless polled or awaited"]
     async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()>;
 
+    #[must_use = "futures do nothing unless polled or awaited"]
     async fn recv_from(&self) -> anyhow::Result<(TargetAddr, Vec<u8>)>;
 }
 
