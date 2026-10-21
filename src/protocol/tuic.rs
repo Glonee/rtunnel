@@ -2,6 +2,12 @@ pub mod codec;
 pub mod inbound;
 pub mod outbound;
 
+// The channel remains bounded as well. Leave room for one maximum UDP packet
+// and its fragment headers before accepting another item into the retry queue.
+const MAX_PENDING_WRITES: usize = 32;
+const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WRITE_BYTES: usize = 128 * 1024;
+
 use tokio_quiche::settings::{ExtraTransportParam, QuicSettings, TlsApplicationSettings};
 
 const CHROME_H3_ALPS_SETTINGS: &[u8] = &[];

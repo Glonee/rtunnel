@@ -2,7 +2,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::{
-    net::{TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket, lookup_host},
     sync::Mutex,
 };
 
@@ -36,7 +36,7 @@ impl Outbound for DirectOutbound {
         );
         Ok(Arc::new(DirectUdpSession {
             ipv4: UdpSocket::bind("0.0.0.0:0").await?,
-            ipv6: UdpSocket::bind("[::]:0").await?,
+            ipv6: UdpSocket::bind("[::]:0").await.ok(),
             ipv4_buf: Mutex::new(vec![0; UDP_BUFFER_SIZE]),
             ipv6_buf: Mutex::new(vec![0; UDP_BUFFER_SIZE]),
         }))
@@ -45,7 +45,7 @@ impl Outbound for DirectOutbound {
 
 struct DirectUdpSession {
     ipv4: UdpSocket,
-    ipv6: UdpSocket,
+    ipv6: Option<UdpSocket>,
     ipv4_buf: Mutex<Vec<u8>>,
     ipv6_buf: Mutex<Vec<u8>>,
 }
@@ -55,13 +55,33 @@ impl ProxyDatagram for DirectUdpSession {
     async fn send_to(&self, target: &TargetAddr, payload: &[u8]) -> anyhow::Result<()> {
         match target {
             TargetAddr::Ip(addr) if matches!(addr.ip(), IpAddr::V6(_)) => {
-                self.ipv6.send_to(payload, *addr).await?;
+                self.ipv6
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("IPv6 UDP is unavailable"))?
+                    .send_to(payload, *addr)
+                    .await?;
             }
             TargetAddr::Ip(addr) => {
                 self.ipv4.send_to(payload, *addr).await?;
             }
             TargetAddr::Domain { host, port } => {
-                self.ipv4.send_to(payload, (host.as_str(), *port)).await?;
+                let mut last_error = None;
+                for addr in lookup_host((host.as_str(), *port)).await? {
+                    let result = if addr.is_ipv4() {
+                        self.ipv4.send_to(payload, addr).await
+                    } else if let Some(socket) = &self.ipv6 {
+                        socket.send_to(payload, addr).await
+                    } else {
+                        continue;
+                    };
+                    match result {
+                        Ok(_) => return Ok(()),
+                        Err(err) => last_error = Some(err),
+                    }
+                }
+                return Err(last_error.map(anyhow::Error::from).unwrap_or_else(|| {
+                    anyhow::anyhow!("no usable UDP address for {host}:{port}")
+                }));
             }
         };
         Ok(())
@@ -75,7 +95,12 @@ impl ProxyDatagram for DirectUdpSession {
                 let (read, source) = received?;
                 Ok((TargetAddr::Ip(source), ipv4_buf[..read].to_vec()))
             }
-            received = self.ipv6.recv_from(ipv6_buf.as_mut_slice()) => {
+            received = async {
+                match &self.ipv6 {
+                    Some(socket) => socket.recv_from(ipv6_buf.as_mut_slice()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let (read, source) = received?;
                 Ok((TargetAddr::Ip(source), ipv6_buf[..read].to_vec()))
             }

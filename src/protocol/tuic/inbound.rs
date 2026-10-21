@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
-    sync::mpsc,
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 use tokio_quiche::{
     ApplicationOverQuic, QuicResult,
@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     config::{InboundConfig, UserConfig},
-    protocol::tuic::{codec, quic_settings},
+    protocol::tuic::{
+        MAX_PENDING_BYTES, MAX_PENDING_WRITES, MAX_WRITE_BYTES, codec, quic_settings,
+    },
     router::Router,
     session::{Command, Session, TargetAddr},
     tls,
@@ -132,6 +134,7 @@ struct TuicApp {
     outbound_tx: mpsc::Sender<QuicWrite>,
     outbound_rx: mpsc::Receiver<QuicWrite>,
     pending_writes: VecDeque<QuicWrite>,
+    read_ready: Arc<Notify>,
 }
 
 struct StreamState {
@@ -172,6 +175,7 @@ enum QuicWrite {
         stream_id: u64,
         data: Vec<u8>,
         fin: bool,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
     },
     Datagram {
         assoc_id: Option<u16>,
@@ -185,6 +189,25 @@ enum QuicWrite {
     Close {
         stream_id: u64,
     },
+}
+
+impl QuicWrite {
+    fn len(&self) -> usize {
+        match self {
+            Self::Data { data, .. }
+            | Self::Datagram { data, .. }
+            | Self::UniStream { data, .. } => data.len(),
+            Self::Close { .. } => 0,
+        }
+    }
+
+    fn stream_id(&self) -> Option<u64> {
+        match self {
+            Self::Data { stream_id, .. } | Self::Close { stream_id } => Some(*stream_id),
+            Self::UniStream { stream_id, .. } => *stream_id,
+            Self::Datagram { .. } => None,
+        }
+    }
 }
 
 impl TuicApp {
@@ -211,7 +234,18 @@ impl TuicApp {
             outbound_tx,
             outbound_rx,
             pending_writes: VecDeque::new(),
+            read_ready: Arc::new(Notify::new()),
         }
+    }
+
+    fn can_pull_write(&self) -> bool {
+        self.pending_writes.len() < MAX_PENDING_WRITES
+            && self
+                .pending_writes
+                .iter()
+                .map(QuicWrite::len)
+                .sum::<usize>()
+                <= MAX_PENDING_BYTES - MAX_WRITE_BYTES
     }
 
     fn check_authentication_deadline(&self) -> QuicResult<()> {
@@ -400,6 +434,7 @@ impl TuicApp {
             initial,
             client_rx,
             self.outbound_tx.clone(),
+            self.read_ready.clone(),
         );
         Ok(())
     }
@@ -513,15 +548,12 @@ impl ApplicationOverQuic for TuicApp {
         } else {
             self.next_udp_cleanup.min(self.authentication_deadline)
         };
-        if self.pending_writes.is_empty() {
-            tokio::select! {
-                write = self.outbound_rx.recv() => {
-                    if let Some(write) = write {
-                        self.pending_writes.push_back(write);
-                    }
-                }
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+        tokio::select! {
+            write = self.outbound_rx.recv(), if self.can_pull_write() => {
+                if let Some(write) = write { self.pending_writes.push_back(write); }
             }
+            _ = self.read_ready.notified() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
         }
         self.check_authentication_deadline()
     }
@@ -529,8 +561,19 @@ impl ApplicationOverQuic for TuicApp {
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         self.check_authentication_deadline()?;
         self.maybe_cleanup_udp_state();
-        while let Some(stream_id) = qconn.stream_readable_next() {
+        let readable: Vec<_> = qconn.readable().collect();
+        for stream_id in readable {
             loop {
+                if let Some(state) = self.streams.get(&stream_id) {
+                    if state.client_tx.is_closed() {
+                        let _ = qconn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                        self.streams.remove(&stream_id);
+                        break;
+                    }
+                    if state.client_tx.capacity() == 0 {
+                        break;
+                    }
+                }
                 let mut buf = [0; 16 * 1024];
                 match qconn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
@@ -565,38 +608,57 @@ impl ApplicationOverQuic for TuicApp {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.process_reads(qconn)?;
         self.check_authentication_deadline()?;
         self.maybe_cleanup_udp_state();
-        while let Ok(write) = self.outbound_rx.try_recv() {
+        while self.can_pull_write() {
+            let Ok(write) = self.outbound_rx.try_recv() else {
+                break;
+            };
             self.pending_writes.push_back(write);
         }
 
-        while let Some(write) = self.pending_writes.pop_front() {
+        // One round, preserving each stream's FIFO while rotating blocked streams.
+        let mut blocked = HashSet::new();
+        let mut datagrams_blocked = false;
+        for _ in 0..self.pending_writes.len() {
+            let Some(write) = self.pending_writes.pop_front() else {
+                break;
+            };
+            if write.stream_id().is_some_and(|id| blocked.contains(&id))
+                || (datagrams_blocked && matches!(write, QuicWrite::Datagram { .. }))
+            {
+                self.pending_writes.push_back(write);
+                continue;
+            }
             match write {
                 QuicWrite::Data {
                     stream_id,
                     data,
                     fin,
+                    permit,
                 } => match qconn.stream_send(stream_id, &data, fin) {
                     Ok(sent) if sent == data.len() => {}
                     Ok(sent) => {
-                        self.pending_writes.push_front(QuicWrite::Data {
+                        self.pending_writes.push_back(QuicWrite::Data {
                             stream_id,
                             data: data[sent..].to_vec(),
                             fin,
+                            permit,
                         });
-                        break;
+                        blocked.insert(stream_id);
                     }
                     // An empty FIN needs no flow-control capacity. Done here
                     // means the stream has already been collected by QUIC.
                     Err(quiche::Error::Done) if fin && data.is_empty() => {}
                     Err(quiche::Error::Done) => {
-                        self.pending_writes.push_front(QuicWrite::Data {
+                        self.pending_writes.push_back(QuicWrite::Data {
                             stream_id,
                             data,
                             fin,
+                            permit,
                         });
-                        break;
+                        blocked.insert(stream_id);
                     }
                     Err(err) => {
                         debug!(%err, stream_id, "tuic stream write failed");
@@ -611,8 +673,8 @@ impl ApplicationOverQuic for TuicApp {
                         Ok(_) => {}
                         Err(quiche::Error::Done) => {
                             self.pending_writes
-                                .push_front(QuicWrite::Datagram { assoc_id, data });
-                            break;
+                                .push_back(QuicWrite::Datagram { assoc_id, data });
+                            datagrams_blocked = true;
                         }
                         Err(quiche::Error::BufferTooShort) => {
                             let fragments = codec::parse_packet(&data).and_then(|packet| {
@@ -623,11 +685,27 @@ impl ApplicationOverQuic for TuicApp {
                             });
                             match fragments {
                                 Ok(fragments) => {
-                                    for fragment in fragments.into_iter().rev() {
-                                        self.pending_writes.push_front(QuicWrite::Datagram {
-                                            assoc_id,
-                                            data: codec::encode_packet(&fragment)?,
-                                        });
+                                    let encoded = fragments
+                                        .iter()
+                                        .map(codec::encode_packet)
+                                        .collect::<anyhow::Result<Vec<_>>>()?;
+                                    let bytes = self
+                                        .pending_writes
+                                        .iter()
+                                        .map(QuicWrite::len)
+                                        .sum::<usize>()
+                                        + encoded.iter().map(Vec::len).sum::<usize>();
+                                    if bytes > MAX_PENDING_BYTES {
+                                        debug!(
+                                            "dropped TUIC UDP response exceeding retry byte budget"
+                                        );
+                                    } else {
+                                        // New fragments need a round even without new network input.
+                                        self.read_ready.notify_one();
+                                        for data in encoded {
+                                            self.pending_writes
+                                                .push_back(QuicWrite::Datagram { assoc_id, data });
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -654,20 +732,20 @@ impl ApplicationOverQuic for TuicApp {
                     match qconn.stream_send(id, &data, true) {
                         Ok(sent) if sent == data.len() => {}
                         Ok(sent) => {
-                            self.pending_writes.push_front(QuicWrite::UniStream {
+                            self.pending_writes.push_back(QuicWrite::UniStream {
                                 assoc_id,
                                 stream_id: Some(id),
                                 data: data[sent..].to_vec(),
                             });
-                            break;
+                            blocked.insert(id);
                         }
-                        Err(quiche::Error::Done) => {
-                            self.pending_writes.push_front(QuicWrite::UniStream {
+                        Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
+                            self.pending_writes.push_back(QuicWrite::UniStream {
                                 assoc_id,
                                 stream_id: Some(id),
                                 data,
                             });
-                            break;
+                            blocked.insert(id);
                         }
                         Err(err) => return Err(Box::new(err)),
                     }
@@ -693,9 +771,13 @@ fn spawn_relay(
     initial: Vec<u8>,
     mut client_rx: mpsc::Receiver<Vec<u8>>,
     quic_tx: mpsc::Sender<QuicWrite>,
+    read_ready: Arc<Notify>,
 ) {
     tokio::spawn(async move {
-        let result: anyhow::Result<()> = async {
+        let permits = Arc::new(Semaphore::new(2));
+        let result: anyhow::Result<()> = tokio::select! {
+            _ = quic_tx.closed() => return,
+            result = async {
             let mut outbound = router.dial(&session).await?;
             if !initial.is_empty() {
                 outbound.write_all(&initial).await?;
@@ -709,6 +791,7 @@ fn spawn_relay(
                     biased;
 
                     maybe_data = client_rx.recv(), if !client_closed => {
+                        read_ready.notify_one();
                         match maybe_data {
                             Some(data) => outbound.write_all(&data).await?,
                             None => {
@@ -717,8 +800,12 @@ fn spawn_relay(
                             }
                         }
                     }
-                    read = outbound.read(&mut buf), if !remote_closed => {
-                        let read = read?;
+                    read = async {
+                        let permit = permits.clone().acquire_owned().await?;
+                        let read = outbound.read(&mut buf).await?;
+                        Ok::<_, anyhow::Error>((read, Arc::new(permit)))
+                    }, if !remote_closed => {
+                        let (read, permit) = read?;
                         if read == 0 {
                             remote_closed = true;
                         }
@@ -727,6 +814,7 @@ fn spawn_relay(
                                 stream_id,
                                 data: buf[..read].to_vec(),
                                 fin: remote_closed,
+                                permit: Some(permit),
                             })
                             .await
                             .map_err(|_| anyhow::anyhow!("tuic connection closed"))?;
@@ -734,8 +822,8 @@ fn spawn_relay(
                 }
             }
             Ok(())
-        }
-        .await;
+        } => result,
+        };
 
         if let Err(err) = result {
             debug!(%err, "tuic relay failed");
@@ -754,8 +842,12 @@ fn spawn_udp_session(
 ) -> UdpSession {
     let (tx, rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        if let Err(err) = run_udp_session(router, inbound, assoc_id, mode, rx, quic_tx).await {
-            debug!(%err, %assoc_id, "tuic udp relay failed");
+        let shutdown = quic_tx.clone();
+        tokio::select! {
+            _ = shutdown.closed() => {}
+            result = run_udp_session(router, inbound, assoc_id, mode, rx, quic_tx) => {
+                if let Err(err) = result { debug!(%err, %assoc_id, "tuic udp relay failed"); }
+            }
         }
     });
     UdpSession {
@@ -1092,3 +1184,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "inbound_tests.rs"]
+mod regression_tests;

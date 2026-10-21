@@ -1964,3 +1964,7 @@ fn test_server_cert(issuer: &Issuer<'static, KeyPair>) -> anyhow::Result<(Certif
     let cert = params.signed_by(&key, issuer)?;
     Ok((cert, key))
 }
+
+#[cfg(test)]
+#[path = "support/lifecycle.rs"]
+mod lifecycle_tests;

@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -83,18 +84,19 @@ impl AcmeManager {
 
     async fn prepare_certificates(&self) -> anyhow::Result<()> {
         for target in &self.targets {
-            fs::create_dir_all(&target.dir).with_context(|| {
+            private_directory(&target.dir).with_context(|| {
                 format!(
                     "failed to create ACME cache directory {}",
                     target.dir.display()
                 )
             })?;
 
+            migrate_cached_certificate(target)?;
             match certificate_cache_status(target, self.cfg.renew_before_days) {
                 CacheStatus::Valid => {
                     info!(
                         domains = ?target.domains,
-                        certificate = %target.cert_path.display(),
+                        certificate = %target.bundle_path().display(),
                         "using cached ACME certificate"
                     );
                 }
@@ -148,11 +150,10 @@ impl AcmeManager {
         let cert_chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
         validate_certificate_pair(&cert_chain_pem, &private_key_pem)
             .context("ACME CA returned an unusable certificate or key")?;
-        atomic_write(&target.key_path, private_key_pem.as_bytes())?;
-        atomic_write(&target.cert_path, cert_chain_pem.as_bytes())?;
+        publish_certificate(target, &cert_chain_pem, &private_key_pem)?;
         info!(
             domains = ?target.domains,
-            certificate = %target.cert_path.display(),
+            certificate = %target.bundle_path().display(),
             "stored ACME certificate"
         );
         Ok(())
@@ -267,8 +268,11 @@ fn configure_targets(
             .entry(domains.clone())
             .or_insert(target_for_domains(acme_cfg, &domains)?);
 
-        tls.certificate = Some(target.cert_path.to_string_lossy().into_owned());
-        tls.private_key = Some(target.key_path.to_string_lossy().into_owned());
+        // A certificate chain and its key are one atomic snapshot. Readers must
+        // read this bundle once, rather than reopening it for the key.
+        let bundle = target.bundle_path().to_string_lossy().into_owned();
+        tls.certificate = Some(bundle.clone());
+        tls.private_key = Some(bundle);
     }
 
     Ok(targets_by_domains.into_values().collect())
@@ -383,7 +387,7 @@ fn text_response(status: StatusCode, body: impl Into<Body>) -> Response<Body> {
 
 async fn load_account(cfg: &AcmeConfig) -> anyhow::Result<Account> {
     let accounts_dir = cfg.cache_dir.join("accounts");
-    fs::create_dir_all(&accounts_dir).with_context(|| {
+    private_directory(&accounts_dir).with_context(|| {
         format!(
             "failed to create ACME account cache directory {}",
             accounts_dir.display()
@@ -392,6 +396,7 @@ async fn load_account(cfg: &AcmeConfig) -> anyhow::Result<Account> {
     let account_path = accounts_dir.join(format!("{}.json", directory_slug(&cfg.directory)));
 
     if account_path.exists() {
+        protect_secret(&account_path)?;
         let raw = fs::read_to_string(&account_path)
             .with_context(|| format!("failed to read ACME account {}", account_path.display()))?;
         let credentials: AccountCredentials = serde_json::from_str(&raw)
@@ -442,10 +447,7 @@ fn directory_url(raw: &str) -> anyhow::Result<String> {
 }
 
 fn certificate_cache_status(target: &AcmeTarget, renew_before_days: u32) -> CacheStatus {
-    let Ok(cert_pem) = fs::read(&target.cert_path) else {
-        return CacheStatus::MissingOrInvalid;
-    };
-    let Ok(key_pem) = fs::read(&target.key_path) else {
+    let Ok((cert_pem, key_pem)) = cached_certificate_bytes(target) else {
         return CacheStatus::MissingOrInvalid;
     };
     if validate_certificate_pair_bytes(&cert_pem, &key_pem).is_err() {
@@ -496,27 +498,116 @@ fn validate_certificate_pair_bytes(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::R
     Ok(())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+impl AcmeTarget {
+    fn bundle_path(&self) -> PathBuf {
+        self.dir.join("bundle.pem")
     }
-    let tmp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("pem")
-    ));
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("failed to write temporary file {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
+}
+
+fn cached_certificate_bytes(target: &AcmeTarget) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    match fs::read(target.bundle_path()) {
+        Ok(bundle) => Ok((bundle.clone(), bundle)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok((fs::read(&target.cert_path)?, fs::read(&target.key_path)?))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn migrate_cached_certificate(target: &AcmeTarget) -> anyhow::Result<()> {
+    if target.key_path.exists() {
+        protect_secret(&target.key_path)?;
+    }
+    if target.bundle_path().exists() {
+        protect_secret(&target.bundle_path())?;
+        return Ok(());
+    }
+    let Ok(cert) = fs::read_to_string(&target.cert_path) else {
+        return Ok(());
+    };
+    let Ok(key) = fs::read_to_string(&target.key_path) else {
+        return Ok(());
+    };
+    if validate_certificate_pair(&cert, &key).is_ok() {
+        publish_certificate(target, &cert, &key)?;
+    }
     Ok(())
+}
+
+fn publish_certificate(target: &AcmeTarget, cert: &str, key: &str) -> anyhow::Result<()> {
+    publish_certificate_with(target, cert, key, |from, to| fs::rename(from, to))
+}
+
+// The commit operation is the only publication boundary. Tests inject failure
+// here after the complete, validated replacement has been written and synced.
+fn publish_certificate_with(
+    target: &AcmeTarget,
+    cert: &str,
+    key: &str,
+    commit: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    validate_certificate_pair(cert, key)?;
+    let bundle = format!("{cert}\n{key}");
+    atomic_write_with(&target.bundle_path(), bundle.as_bytes(), commit)
+}
+
+fn protect_secret(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn private_directory(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with(path, bytes, |from, to| fs::rename(from, to))
+}
+
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    commit: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        private_directory(parent)?;
+    }
+    // Unique + create_new prevents following a pre-existing temporary symlink.
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        commit(&tmp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("failed to atomically write {}", path.display()))
 }
 
 fn domain_slug(domains: &[String]) -> String {
@@ -625,3 +716,7 @@ mod tests {
         assert_eq!(body.as_ref(), b"token123.thumbprint");
     }
 }
+
+#[cfg(test)]
+#[path = "acme_tests.rs"]
+mod regression_tests;
