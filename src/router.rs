@@ -14,10 +14,8 @@ use crate::{
 
 #[async_trait]
 pub trait Outbound: Send + Sync {
-    #[must_use = "futures do nothing unless polled or awaited"]
     async fn dial(&self, session: &Session) -> anyhow::Result<BoxStream>;
 
-    #[must_use = "futures do nothing unless polled or awaited"]
     async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
         let _ = session;
         bail!("udp is not supported by this outbound")

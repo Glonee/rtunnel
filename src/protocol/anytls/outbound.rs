@@ -139,7 +139,7 @@ impl ClientSessionPool {
             .iter()
             .filter(|session| {
                 let active = session.active_stream_count();
-                active > 0 && max_streams.is_none_or(|max| active < max)
+                active > 0 && max_streams.map_or(true, |max| active < max)
             })
             .min_by(|left, right| {
                 let left_active = left.active_stream_count();
