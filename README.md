@@ -40,6 +40,11 @@ SOCKS5 UDP associations accept packets only from the TCP client's IP. A nonzero
 client port in the UDP ASSOCIATE request is enforced; otherwise the first valid
 packet selects the UDP port for the association.
 
+Direct UDP uses one dual-stack socket for IPv4 and IPv6, with IPv4 reply sources
+reported as ordinary IPv4 addresses. Recognized IPv6 availability errors allow
+an IPv4-only fallback; permission and resource failures are reported. Domain
+destinations are resolved by the system resolver when Direct sends the packet.
+
 TUIC UDP uses the configured routing rules in both native and QUIC stream modes.
 TUIC clients must authenticate within 10 seconds of completing the QUIC handshake.
 Before authentication, each connection may retain at most 256 KiB of incoming
@@ -93,6 +98,13 @@ public trusted certificates after testing. HTTP-01 requires the configured
 `.rtunnel/acme` by default. If no valid cached certificate exists and issuance
 fails, startup fails; if a cached certificate is still valid, renewal failures
 are logged and retried later.
+
+New certificates are published as a single `bundle.pem` containing the certificate
+chain and private key. The complete pair is validated before an atomic replacement;
+new handshakes read one snapshot. On Unix, secret files use mode `0600` and directories
+containing them use `0700`. Existing `cert.pem`/`key.pem` pairs in the directory-specific
+cache are imported locally on startup without issuing another certificate; those
+legacy files are retained, but subsequent renewals update the bundle.
 
 Certificate caches are separated by the ACME directory URL, so staging and
 production certificates cannot be mixed. Legacy certificate files directly under

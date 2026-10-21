@@ -22,6 +22,7 @@ mimalloc = "0.1.52"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
+socket2 = "=0.6.4"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-boring = "5"
 tokio-quiche = { version = "0.19.0", default-features = false }

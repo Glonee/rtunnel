@@ -1,16 +1,18 @@
 use std::{
     collections::{HashMap, VecDeque},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
     },
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::UdpSocket,
-    sync::mpsc,
+    sync::{Notify, mpsc, oneshot},
     time::{Duration, Instant},
 };
 use tokio_quiche::{
@@ -25,7 +27,9 @@ use uuid::Uuid;
 
 use crate::{
     config::OutboundConfig,
-    protocol::tuic::{codec, quic_settings},
+    protocol::tuic::{
+        MAX_PENDING_BYTES, MAX_PENDING_WRITES, MAX_WRITE_BYTES, codec, quic_settings,
+    },
     router::Outbound,
     session::{BoxDatagram, BoxStream, Command, ProxyDatagram, Session, TargetAddr},
     tls,
@@ -134,8 +138,11 @@ impl Outbound for TuicOutbound {
             }
         });
 
+        let read_ready = Arc::new(Notify::new());
+        let reader_ready = read_ready.clone();
         tokio::spawn(async move {
             while let Some(data) = stream_rx.recv().await {
+                reader_ready.notify_one();
                 if app_writer.write_all(&data).await.is_err() {
                     break;
                 }
@@ -143,7 +150,11 @@ impl Outbound for TuicOutbound {
             let _ = app_writer.shutdown().await;
         });
 
-        let app = TuicClientApp::new(self.uuid, self.password.clone(), target, quic_rx, stream_tx);
+        let (owner, owner_gone) = oneshot::channel();
+        let mut app =
+            TuicClientApp::new(self.uuid, self.password.clone(), target, quic_rx, stream_tx);
+        app.owner_gone = Some(owner_gone);
+        app.read_ready = read_ready;
         connect_with_config(socket, Some(server_name.as_str()), &params, app)
             .await
             .map_err(|err| {
@@ -155,7 +166,10 @@ impl Outbound for TuicOutbound {
             "tuic outbound connected"
         );
 
-        Ok(Box::new(client_side))
+        Ok(Box::new(TuicStream {
+            inner: client_side,
+            _owner: owner,
+        }))
     }
 
     async fn dial_udp(&self, session: &Session) -> anyhow::Result<BoxDatagram> {
@@ -206,6 +220,52 @@ impl Outbound for TuicOutbound {
     }
 }
 
+// AsyncWrite::shutdown is a half-close; only dropping the owner cancels the
+// entire dedicated QUIC connection, including a peer that stays silent.
+struct TuicStream {
+    inner: DuplexStream,
+    _owner: oneshot::Sender<()>,
+}
+impl AsyncRead for TuicStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for TuicStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+fn close_connection(conn: &mut QuicheConnection) -> QuicResult<()> {
+    let _ = conn.close(true, 0, b"owner finished");
+    // Returning terminates the worker even if it has no packets left to send.
+    Err(anyhow::anyhow!("TUIC owner finished").into())
+}
+
+async fn owner_dropped(owner: &mut Option<oneshot::Receiver<()>>) {
+    match owner {
+        Some(receiver) => {
+            let _ = receiver.await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 struct TuicClientApp {
     uuid: Uuid,
     password: String,
@@ -214,6 +274,9 @@ struct TuicClientApp {
     stream_tx: Option<mpsc::Sender<Vec<u8>>>,
     pending_writes: VecDeque<QuicWrite>,
     next_heartbeat: Instant,
+    local_fin: bool,
+    owner_gone: Option<oneshot::Receiver<()>>,
+    read_ready: Arc<Notify>,
 }
 
 enum QuicWrite {
@@ -238,7 +301,34 @@ impl TuicClientApp {
             stream_tx: Some(stream_tx),
             pending_writes: VecDeque::new(),
             next_heartbeat: Instant::now() + HEARTBEAT_INTERVAL,
+            local_fin: false,
+            owner_gone: None,
+            read_ready: Arc::new(Notify::new()),
         }
+    }
+
+    fn can_pull_write(&self) -> bool {
+        self.pending_writes.len() < MAX_PENDING_WRITES
+    }
+
+    fn check_owner(&mut self, conn: &mut QuicheConnection) -> QuicResult<()> {
+        if self.owner_gone.as_mut().is_some_and(|owner| {
+            !matches!(owner.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+        }) {
+            return close_connection(conn);
+        }
+        // Wait for the send side to be acknowledged/collected before closing;
+        // merely queuing FIN must not discard buffered stream data.
+        if self.local_fin
+            && self.stream_tx.is_none()
+            && matches!(
+                conn.stream_capacity(CONNECT_STREAM_ID),
+                Err(quiche::Error::InvalidStreamState(_))
+            )
+        {
+            return close_connection(conn);
+        }
+        Ok(())
     }
 
     fn send_all_or_queue(
@@ -281,26 +371,37 @@ impl ApplicationOverQuic for TuicClientApp {
         true
     }
 
-    async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
-        if self.pending_writes.is_empty() {
-            tokio::select! {
-                write = self.outbound_rx.recv(), if !self.outbound_rx.is_closed() || !self.outbound_rx.is_empty() => {
-                    if let Some(write) = write {
-                        self.pending_writes.push_back(write);
-                    }
-                }
-                _ = tokio::time::sleep_until(self.next_heartbeat) => {
-                    self.pending_writes.push_back(QuicWrite::Heartbeat);
-                    self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-                }
+    async fn wait_for_data(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        self.check_owner(qconn)?;
+        tokio::select! {
+            _ = owner_dropped(&mut self.owner_gone) => return close_connection(qconn),
+            write = self.outbound_rx.recv(), if self.can_pull_write() && (!self.outbound_rx.is_closed() || !self.outbound_rx.is_empty()) => {
+                if let Some(write) = write { self.pending_writes.push_back(write); }
+            }
+            _ = self.read_ready.notified() => {}
+            _ = tokio::time::sleep_until(self.next_heartbeat) => {
+                if self.can_pull_write() { self.pending_writes.push_back(QuicWrite::Heartbeat); }
+                self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
             }
         }
         Ok(())
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        while let Some(stream_id) = qconn.stream_readable_next() {
+        self.check_owner(qconn)?;
+        let readable: Vec<_> = qconn.readable().collect();
+        for stream_id in readable {
             loop {
+                if stream_id == CONNECT_STREAM_ID
+                    && let Some(tx) = &self.stream_tx
+                {
+                    if tx.is_closed() {
+                        return close_connection(qconn);
+                    }
+                    if tx.capacity() == 0 {
+                        break;
+                    }
+                }
                 let mut buf = [0; 16 * 1024];
                 match qconn.stream_recv(stream_id, &mut buf) {
                     Ok((read, fin)) => {
@@ -333,7 +434,11 @@ impl ApplicationOverQuic for TuicClientApp {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        while let Ok(write) = self.outbound_rx.try_recv() {
+        self.process_reads(qconn)?;
+        while self.can_pull_write() {
+            let Ok(write) = self.outbound_rx.try_recv() else {
+                break;
+            };
             self.pending_writes.push_back(write);
         }
 
@@ -364,13 +469,14 @@ impl ApplicationOverQuic for TuicClientApp {
                     }
                 }
                 QuicWrite::Close => match qconn.stream_send(CONNECT_STREAM_ID, &[], true) {
-                    Ok(_) => {}
-                    Err(quiche::Error::Done) => {}
-                    Err(_) => {}
+                    Ok(_) | Err(quiche::Error::Done) => {
+                        self.local_fin = true;
+                    }
+                    Err(err) => return Err(Box::new(err)),
                 },
             }
         }
-        Ok(())
+        self.check_owner(qconn)
     }
 }
 
@@ -445,6 +551,19 @@ impl TuicUdpOutboundApp {
         }
     }
 
+    fn can_pull_write(&self) -> bool {
+        self.pending_writes.len() < MAX_PENDING_WRITES
+            && self
+                .pending_writes
+                .iter()
+                .map(|write| match write {
+                    TuicUdpWrite::Packet(packet) => packet.payload.len() + 274,
+                    TuicUdpWrite::Heartbeat => 2,
+                })
+                .sum::<usize>()
+                <= MAX_PENDING_BYTES - MAX_WRITE_BYTES
+    }
+
     fn handle_packet(&mut self, data: &[u8]) -> QuicResult<()> {
         let packet = codec::parse_packet(data)?;
         if let Some(packet) = self.packet_assembler.push(packet)? {
@@ -475,18 +594,22 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
         true
     }
 
-    async fn wait_for_data(&mut self, _qconn: &mut QuicheConnection) -> QuicResult<()> {
-        if self.pending_writes.is_empty() {
-            tokio::select! {
-                write = self.outbound_rx.recv() => {
-                    if let Some(write) = write {
-                        self.pending_writes.push_back(write);
-                    }
+    async fn wait_for_data(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
+        if self.outbound_rx.is_closed() {
+            return close_connection(qconn);
+        }
+        tokio::select! {
+            write = self.outbound_rx.recv(), if self.can_pull_write() => {
+                match write {
+                    Some(write) => self.pending_writes.push_back(write),
+                    None => return close_connection(qconn),
                 }
-                _ = tokio::time::sleep_until(self.next_heartbeat) => {
-                    self.pending_writes.push_back(TuicUdpWrite::Heartbeat);
-                    self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-                }
+            }
+            // A full retry queue must still notice its owner disappearing.
+            _ = self.response_tx.closed() => return close_connection(qconn),
+            _ = tokio::time::sleep_until(self.next_heartbeat) => {
+                if self.can_pull_write() { self.pending_writes.push_back(TuicUdpWrite::Heartbeat); }
+                self.next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
             }
         }
         Ok(())
@@ -525,7 +648,13 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        while let Ok(write) = self.outbound_rx.try_recv() {
+        if self.outbound_rx.is_closed() {
+            return close_connection(qconn);
+        }
+        while self.can_pull_write() {
+            let Ok(write) = self.outbound_rx.try_recv() else {
+                break;
+            };
             self.pending_writes.push_back(write);
         }
 
@@ -545,9 +674,29 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
                                 qconn.dgram_max_writable_len().unwrap_or(0),
                             ) {
                                 Ok(fragments) => {
-                                    for fragment in fragments.into_iter().rev() {
-                                        self.pending_writes
-                                            .push_front(TuicUdpWrite::Packet(fragment));
+                                    let bytes = self
+                                        .pending_writes
+                                        .iter()
+                                        .map(|write| match write {
+                                            TuicUdpWrite::Packet(packet) => {
+                                                packet.payload.len() + 274
+                                            }
+                                            TuicUdpWrite::Heartbeat => 2,
+                                        })
+                                        .sum::<usize>()
+                                        + fragments
+                                            .iter()
+                                            .map(|packet| packet.payload.len() + 274)
+                                            .sum::<usize>();
+                                    if bytes > MAX_PENDING_BYTES {
+                                        debug!(
+                                            "dropped TUIC UDP packet exceeding retry byte budget"
+                                        );
+                                    } else {
+                                        for fragment in fragments.into_iter().rev() {
+                                            self.pending_writes
+                                                .push_front(TuicUdpWrite::Packet(fragment));
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -574,3 +723,7 @@ impl ApplicationOverQuic for TuicUdpOutboundApp {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "outbound_tests.rs"]
+mod regression_tests;

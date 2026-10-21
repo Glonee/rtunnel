@@ -288,8 +288,13 @@ fn load_certificate_pair(
 ) -> anyhow::Result<(Vec<X509>, PKey<Private>)> {
     let cert_pem = fs::read(cert_path)
         .with_context(|| format!("failed to read TLS certificate chain {cert_path}"))?;
-    let key_pem =
-        fs::read(key_path).with_context(|| format!("failed to read TLS private key {key_path}"))?;
+    let key_pem = if cert_path == key_path {
+        // ACME bundles are replaced atomically; never mix two generations by
+        // reopening the same path between certificate and private-key reads.
+        cert_pem.clone()
+    } else {
+        fs::read(key_path).with_context(|| format!("failed to read TLS private key {key_path}"))?
+    };
     let certs = X509::stack_from_pem(&cert_pem)
         .with_context(|| format!("failed to parse TLS certificate chain {cert_path}"))?;
     ensure!(

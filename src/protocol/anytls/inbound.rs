@@ -16,7 +16,7 @@ use tokio::{
         copy_bidirectional,
     },
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc},
+    sync::{mpsc, oneshot},
 };
 use tokio_boring::{SslStream, accept};
 use tracing::{debug, info};
@@ -29,7 +29,7 @@ use crate::{
     tls,
 };
 
-type TlsWriteHalf = WriteHalf<SslStream<TcpStream>>;
+const FRAME_WRITER_CAPACITY: usize = 32;
 const UOT_CHANNEL_CAPACITY: usize = 128;
 const STATIC_FALLBACK_BODY: &[u8] =
     b"<!doctype html><html><head><title>404 Not Found</title></head>\
@@ -83,14 +83,17 @@ pub async fn serve(
                         }
                     };
                 let (mut reader, writer) = tokio::io::split(tls_stream);
-                let writer = Arc::new(Mutex::new(writer));
+                let (writer, _writer_task) = spawn_frame_writer(writer);
                 let mut streams: HashMap<u32, InboundStream> = HashMap::new();
                 let mut synacked_streams: HashSet<u32> = HashSet::new();
                 let mut settings_seen = false;
                 let mut client_v2 = false;
 
                 loop {
-                    let frame = codec::read_frame(&mut reader).await?;
+                    let frame = tokio::select! {
+                        frame = codec::read_frame(&mut reader) => frame?,
+                        _ = writer.tx.closed() => anyhow::bail!("anytls session writer closed"),
+                    };
                     match frame.command {
                         codec::CMD_SETTINGS => {
                             settings_seen = true;
@@ -136,14 +139,14 @@ pub async fn serve(
                             }
                             if let Some(stream) = streams.get_mut(&frame.stream_id) {
                                 match stream {
-                                    InboundStream::Tcp(stream) => {
+                                    InboundStream::Tcp { writer: stream, .. } => {
                                         if let Err(err) = stream.write_all(&frame.data).await {
                                             debug!(%err, stream_id = frame.stream_id, "anytls stream write failed");
                                             streams.remove(&frame.stream_id);
                                             write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
                                         }
                                     }
-                                    InboundStream::Udp(tx) => {
+                                    InboundStream::Udp { tx, .. } => {
                                         let _ = tx.send(frame.data).await;
                                     }
                                 }
@@ -163,18 +166,18 @@ pub async fn serve(
                                 if consumed < frame.data.len() {
                                     let _ = tx.send(frame.data[consumed..].to_vec()).await;
                                 }
-                                streams.insert(frame.stream_id, InboundStream::Udp(tx));
                                 if client_v2 && synacked_streams.insert(frame.stream_id) {
                                     write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[])
                                         .await?;
                                 }
-                                spawn_uot_reader(
+                                let reader_task = spawn_uot_reader(
                                     frame.stream_id,
                                     cfg.tag.clone(),
                                     rx,
                                     router.clone(),
                                     writer.clone(),
                                 );
+                                streams.insert(frame.stream_id, InboundStream::Udp { tx, _reader: reader_task });
                                 continue;
                             }
 
@@ -200,12 +203,12 @@ pub async fn serve(
                                 write_frame(&writer, codec::CMD_FIN, frame.stream_id, &[]).await?;
                                 continue;
                             }
-                            streams.insert(frame.stream_id, InboundStream::Tcp(write_half));
                             if client_v2 && synacked_streams.insert(frame.stream_id) {
                                 write_frame(&writer, codec::CMD_SYNACK, frame.stream_id, &[])
                                     .await?;
                             }
-                            spawn_outbound_reader(frame.stream_id, read_half, writer.clone());
+                            let reader_task = spawn_outbound_reader(frame.stream_id, read_half, writer.clone());
+                            streams.insert(frame.stream_id, InboundStream::Tcp { writer: write_half, _reader: reader_task });
                         }
                         codec::CMD_FIN => {
                             streams.remove(&frame.stream_id);
@@ -336,37 +339,86 @@ where
     }
 }
 
-async fn write_frame<W>(
-    writer: &Arc<Mutex<W>>,
+#[derive(Clone)]
+struct FrameWriter {
+    tx: mpsc::Sender<QueuedFrame>,
+}
+
+struct QueuedFrame {
+    bytes: Vec<u8>,
+    completed: oneshot::Sender<std::io::Result<()>>,
+}
+
+// Only this session-owned task touches the TLS write half. Stream cancellation
+// may drop an acknowledgement receiver, but cannot interrupt a started frame.
+// The owner guard is kept by the session, never by an individual relay.
+fn spawn_frame_writer<W>(mut writer: W) -> (FrameWriter, ReaderTask)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<QueuedFrame>(FRAME_WRITER_CAPACITY);
+    let task = ReaderTask(tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let result = writer.write_all(&frame.bytes).await;
+            let failed = result.is_err();
+            let _ = frame.completed.send(result);
+            // A transport error may leave a partial frame. Close the queue and
+            // session rather than allowing any subsequent frame onto this TLS.
+            if failed {
+                break;
+            }
+        }
+    }));
+    (FrameWriter { tx }, task)
+}
+
+async fn write_frame(
+    writer: &FrameWriter,
     command: u8,
     stream_id: u32,
     data: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut writer = writer.lock().await;
-    codec::write_frame(&mut *writer, command, stream_id, data).await
+) -> anyhow::Result<()> {
+    // Reserve before encoding: blocked producers do not allocate queued frames.
+    // At most 32 queued frames plus the active frame, each <= 65542 bytes.
+    let permit = writer.tx.reserve().await.context("anytls writer closed")?;
+    let bytes = codec::encode_frame(command, stream_id, data)?;
+    let (completed, completion) = oneshot::channel();
+    permit.send(QueuedFrame { bytes, completed });
+    completion.await.context("anytls writer stopped")??;
+    Ok(())
 }
 
-async fn write_alert<W>(writer: &Arc<Mutex<W>>, message: &str) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+async fn write_alert(writer: &FrameWriter, message: &str) -> anyhow::Result<()> {
     write_frame(writer, codec::CMD_ALERT, 0, message.as_bytes()).await
 }
 
 enum InboundStream {
-    Tcp(WriteHalf<BoxStream>),
-    Udp(mpsc::Sender<Vec<u8>>),
+    Tcp {
+        writer: WriteHalf<BoxStream>,
+        _reader: ReaderTask,
+    },
+    Udp {
+        tx: mpsc::Sender<Vec<u8>>,
+        _reader: ReaderTask,
+    },
+}
+
+// An owner cancels its task on drop: stream guards promptly release quiet targets;
+// the separate session guard releases the frame writer only on session exit.
+struct ReaderTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaderTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn spawn_outbound_reader(
     stream_id: u32,
     mut read_half: ReadHalf<BoxStream>,
-    writer: Arc<Mutex<TlsWriteHalf>>,
-) {
-    tokio::spawn(async move {
+    writer: FrameWriter,
+) -> ReaderTask {
+    ReaderTask(tokio::spawn(async move {
         let mut buf = [0; 16 * 1024];
         loop {
             match read_half.read(&mut buf).await {
@@ -388,7 +440,7 @@ fn spawn_outbound_reader(
                 }
             }
         }
-    });
+    }))
 }
 
 fn spawn_uot_reader(
@@ -396,15 +448,15 @@ fn spawn_uot_reader(
     inbound: String,
     rx: mpsc::Receiver<Vec<u8>>,
     router: Arc<Router>,
-    writer: Arc<Mutex<TlsWriteHalf>>,
-) {
-    tokio::spawn(async move {
+    writer: FrameWriter,
+) -> ReaderTask {
+    ReaderTask(tokio::spawn(async move {
         let result = run_uot_stream(stream_id, inbound, rx, router, writer.clone()).await;
         if let Err(err) = result {
             debug!(%err, "anytls uot stream failed");
         }
         let _ = write_frame(&writer, codec::CMD_FIN, stream_id, &[]).await;
-    });
+    }))
 }
 
 async fn run_uot_stream(
@@ -412,7 +464,7 @@ async fn run_uot_stream(
     inbound: String,
     rx: mpsc::Receiver<Vec<u8>>,
     router: Arc<Router>,
-    writer: Arc<Mutex<TlsWriteHalf>>,
+    writer: FrameWriter,
 ) -> anyhow::Result<()> {
     let mut input = ChunkReader::new(rx);
     let connect = input.read_u8().await? == 1;
@@ -435,7 +487,7 @@ async fn run_uot_connect_stream(
     target: TargetAddr,
     mut input: ChunkReader,
     outbound: BoxDatagram,
-    writer: Arc<Mutex<TlsWriteHalf>>,
+    writer: FrameWriter,
 ) -> anyhow::Result<()> {
     loop {
         // Keep the framing read alive while responses are forwarded.
@@ -462,7 +514,7 @@ async fn run_uot_packet_stream(
     stream_id: u32,
     mut input: ChunkReader,
     outbound: BoxDatagram,
-    writer: Arc<Mutex<TlsWriteHalf>>,
+    writer: FrameWriter,
 ) -> anyhow::Result<()> {
     loop {
         // Keep the framing read alive while responses are forwarded.
@@ -624,3 +676,7 @@ impl ChunkReader {
         Ok(output)
     }
 }
+
+#[cfg(test)]
+#[path = "inbound_tests.rs"]
+mod tests;
