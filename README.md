@@ -40,6 +40,11 @@ SOCKS5 UDP associations accept packets only from the TCP client's IP. A nonzero
 client port in the UDP ASSOCIATE request is enforced; otherwise the first valid
 packet selects the UDP port for the association.
 
+Direct UDP uses one dual-stack socket for IPv4 and IPv6, with IPv4 reply sources
+reported as ordinary IPv4 addresses. Recognized IPv6 availability errors allow
+an IPv4-only fallback; permission and resource failures are reported. Domain
+destinations are resolved by the system resolver when Direct sends the packet.
+
 TUIC UDP uses the configured routing rules in both native and QUIC stream modes.
 TUIC clients must authenticate within 10 seconds of completing the QUIC handshake.
 Before authentication, each connection may retain at most 256 KiB of incoming
