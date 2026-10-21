@@ -176,25 +176,26 @@ impl AcmeManager {
             .new_order(&NewOrder::new(identifiers.as_slice()))
             .await?;
 
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result?;
-            match authz.status {
-                AuthorizationStatus::Pending => {}
-                AuthorizationStatus::Valid => continue,
-                other => bail!("unexpected ACME authorization status {other:?}"),
-            }
+        {
+            let mut authorizations = order.authorizations();
+            while let Some(result) = authorizations.next().await {
+                let mut authz = result?;
+                match authz.status {
+                    AuthorizationStatus::Pending => {}
+                    AuthorizationStatus::Valid => continue,
+                    other => bail!("unexpected ACME authorization status {other:?}"),
+                }
 
-            let mut challenge = authz
-                .challenge(ChallengeType::Http01)
-                .context("ACME authorization did not offer an HTTP-01 challenge")?;
-            let token = challenge.token.clone();
-            let key_authorization = challenge.key_authorization().as_str().to_owned();
-            challenges.insert(token.clone(), key_authorization).await;
-            tokens.push(token);
-            challenge.set_ready().await?;
+                let mut challenge = authz
+                    .challenge(ChallengeType::Http01)
+                    .context("ACME authorization did not offer an HTTP-01 challenge")?;
+                let token = challenge.token.clone();
+                let key_authorization = challenge.key_authorization().as_str().to_owned();
+                challenges.insert(token.clone(), key_authorization).await;
+                tokens.push(token);
+                challenge.set_ready().await?;
+            }
         }
-        drop(authorizations);
 
         let retry = RetryPolicy::new().timeout(Duration::from_secs(90));
         let status = order.poll_ready(&retry).await?;
@@ -341,10 +342,10 @@ impl ChallengeServer {
             }
             _ = time::sleep(CHALLENGE_SERVER_SHUTDOWN_TIMEOUT) => {
                 self.task.abort();
-                if let Err(err) = self.task.await {
-                    if !err.is_cancelled() {
-                        warn!(%err, "ACME HTTP-01 listener task failed after forced shutdown");
-                    }
+                if let Err(err) = self.task.await
+                    && !err.is_cancelled()
+                {
+                    warn!(%err, "ACME HTTP-01 listener task failed after forced shutdown");
                 }
             }
         }

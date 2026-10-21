@@ -1435,27 +1435,25 @@ async fn spawn_anytls_reuse_probe_server()
                     .await;
                 }
                 anytls_codec::CMD_SYN => {}
-                anytls_codec::CMD_PSH => {
-                    if anytls_codec::decode_socksaddr(&frame.data).is_ok() {
-                        opened += 1;
-                        let _ = opened_tx.send(frame.stream_id);
-                        let _ = anytls_codec::write_frame(
-                            &mut stream,
-                            anytls_codec::CMD_SYNACK,
-                            frame.stream_id,
-                            &[],
-                        )
-                        .await;
-                        let _ = anytls_codec::write_frame(
-                            &mut stream,
-                            anytls_codec::CMD_PSH,
-                            frame.stream_id,
-                            b"ok",
-                        )
-                        .await;
-                        if opened == 2 {
-                            return;
-                        }
+                anytls_codec::CMD_PSH if anytls_codec::decode_socksaddr(&frame.data).is_ok() => {
+                    opened += 1;
+                    let _ = opened_tx.send(frame.stream_id);
+                    let _ = anytls_codec::write_frame(
+                        &mut stream,
+                        anytls_codec::CMD_SYNACK,
+                        frame.stream_id,
+                        &[],
+                    )
+                    .await;
+                    let _ = anytls_codec::write_frame(
+                        &mut stream,
+                        anytls_codec::CMD_PSH,
+                        frame.stream_id,
+                        b"ok",
+                    )
+                    .await;
+                    if opened == 2 {
+                        return;
                     }
                 }
                 _ => {}
@@ -1628,9 +1626,8 @@ impl TuicUdpClientApp {
         qconn: &mut QuicheConnection,
         write: TuicTestUdpWrite,
     ) -> QuicResult<()> {
-        match self.try_send(qconn, write)? {
-            Some(write) => self.pending_writes.push_back(write),
-            None => {}
+        if let Some(write) = self.try_send(qconn, write)? {
+            self.pending_writes.push_back(write);
         }
         Ok(())
     }
